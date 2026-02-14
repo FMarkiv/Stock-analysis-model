@@ -1,0 +1,7 @@
+duckdb
+yfinance
+requests
+pyyaml
+pandas
+plotly
+rich
