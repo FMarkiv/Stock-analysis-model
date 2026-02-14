@@ -5,6 +5,7 @@ Verifies that all ingestion functions correctly transform data and
 store it in DuckDB with proper upsert behaviour.
 """
 
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch, PropertyMock
@@ -330,37 +331,239 @@ def test_ingest_financials(mock_yf, mock_init_db):
     _teardown(con)
 
 
+# ---------------------------------------------------------------------------
+# Mock data factories – SEC EDGAR
+# ---------------------------------------------------------------------------
+
+def _make_company_tickers_json():
+    """Mock SEC company_tickers.json response."""
+    return {
+        "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+        "1": {"cik_str": 789019, "ticker": "MSFT", "title": "Microsoft Corp"},
+    }
+
+
+def _make_edgar_company_facts(with_segments=True):
+    """Mock SEC EDGAR companyfacts JSON with optional segment data."""
+    base_facts = []
+    if with_segments:
+        for fy in [2024, 2023, 2022, 2021]:
+            base_facts.extend([
+                {
+                    "end": f"{fy}-09-30",
+                    "val": 200_000_000_000 + fy * 1_000_000,
+                    "accn": f"0000320193-{fy}-000001",
+                    "fy": fy, "fp": "FY", "form": "10-K",
+                    "filed": f"{fy}-10-30",
+                    "dimensions": {
+                        "srt:ProductOrServiceAxis": "aapl:IPhoneMember"
+                    },
+                },
+                {
+                    "end": f"{fy}-09-30",
+                    "val": 85_000_000_000 + fy * 500_000,
+                    "accn": f"0000320193-{fy}-000001",
+                    "fy": fy, "fp": "FY", "form": "10-K",
+                    "filed": f"{fy}-10-30",
+                    "dimensions": {
+                        "srt:ProductOrServiceAxis": "aapl:ServicesMember"
+                    },
+                },
+                {
+                    # Non-segmented total (should be ignored)
+                    "end": f"{fy}-09-30",
+                    "val": 390_000_000_000,
+                    "accn": f"0000320193-{fy}-000001",
+                    "fy": fy, "fp": "FY", "form": "10-K",
+                    "filed": f"{fy}-10-30",
+                },
+            ])
+    else:
+        # Only consolidated totals, no segment dimensions
+        for fy in [2024, 2023, 2022, 2021]:
+            base_facts.append({
+                "end": f"{fy}-09-30",
+                "val": 390_000_000_000,
+                "accn": f"0000320193-{fy}-000001",
+                "fy": fy, "fp": "FY", "form": "10-K",
+                "filed": f"{fy}-10-30",
+            })
+
+    return {
+        "cik": 320193,
+        "entityName": "Apple Inc.",
+        "facts": {
+            "us-gaap": {
+                "RevenueFromContractWithCustomerExcludingAssessedTax": {
+                    "label": "Revenue",
+                    "units": {"USD": base_facts},
+                }
+            }
+        },
+    }
+
+
+def _mock_requests_get_success(url, **kwargs):
+    """Mock requests.get that returns EDGAR data with segments."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    if "company_tickers" in url:
+        resp.json.return_value = _make_company_tickers_json()
+    else:
+        resp.json.return_value = _make_edgar_company_facts(with_segments=True)
+    return resp
+
+
+def _mock_requests_get_no_segments(url, **kwargs):
+    """Mock requests.get that returns EDGAR data without segments."""
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.raise_for_status = MagicMock()
+    if "company_tickers" in url:
+        resp.json.return_value = _make_company_tickers_json()
+    else:
+        resp.json.return_value = _make_edgar_company_facts(with_segments=False)
+    return resp
+
+
+def _mock_requests_get_failure(url, **kwargs):
+    """Mock requests.get that raises an exception."""
+    raise ConnectionError("mocked network failure")
+
+
+def _mock_config_with_overrides():
+    return {
+        "api_keys": {"sec_edgar": {"user_agent": "Test User test@example.com"}},
+        "segment_overrides": {
+            "AAPL": [
+                {"name": "iPhone", "revenue_pct": 0.52},
+                {"name": "Services", "revenue_pct": 0.22},
+                {"name": "Mac", "revenue_pct": 0.10},
+                {"name": "iPad", "revenue_pct": 0.08},
+                {"name": "Wearables", "revenue_pct": 0.08},
+            ]
+        },
+    }
+
+
+def _mock_config_no_overrides():
+    return {
+        "api_keys": {"sec_edgar": {"user_agent": "Test User test@example.com"}},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Segment tests
+# ---------------------------------------------------------------------------
+
+
+@patch("data.ingest.requests.get", side_effect=_mock_requests_get_success)
+@patch("data.ingest._load_config", return_value=_mock_config_no_overrides())
+@patch("data.ingest.init_db")
+def test_ingest_segments_edgar(mock_init_db, mock_config, mock_requests):
+    """Test segment ingestion from SEC EDGAR XBRL data."""
+    from data.ingest import ingest_segments_edgar
+
+    con = _setup()
+    mock_init_db.return_value = con
+
+    result = ingest_segments_edgar("AAPL")
+
+    assert result["ticker"] == "AAPL"
+    assert result["source"] == "edgar"
+    assert result["segments_loaded"] == 8  # 2 segments × 4 years
+
+    rows = con.execute(
+        "SELECT period, segment_name, revenue FROM segments "
+        "WHERE ticker = 'AAPL' ORDER BY period, segment_name"
+    ).fetchall()
+    assert len(rows) == 8
+
+    segment_names = {r[1] for r in rows}
+    assert "IPhone" in segment_names
+    assert "Services" in segment_names
+
+    for period, seg_name, revenue in rows:
+        assert period.startswith("FY")
+        assert revenue > 0
+
+    print(f"  PASS: ingest_segments_edgar loaded {result['segments_loaded']} entries (source: edgar)")
+    for period, seg_name, revenue in rows:
+        print(f"         {period} {seg_name}: ${revenue/1e9:.1f}B")
+    _teardown(con)
+
+
+@patch("data.ingest.requests.get", side_effect=_mock_requests_get_no_segments)
+@patch("data.ingest._load_config", return_value=_mock_config_with_overrides())
 @patch("data.ingest.init_db")
 @patch("data.ingest.yf")
-def test_ingest_segments(mock_yf, mock_init_db):
-    from data.ingest import ingest_segments
+def test_ingest_segments_config_fallback(mock_yf, mock_init_db, mock_config, mock_requests):
+    """Test fallback to config overrides when EDGAR has no segment data."""
+    from data.ingest import ingest_segments_edgar, ingest_financials_from_yfinance
 
     con = _setup()
     mock_init_db.return_value = con
     mock_yf.Ticker.return_value = _mock_ticker()
 
-    result = ingest_segments("AAPL")
+    # First load financials so total_revenue exists in the DB
+    ingest_financials_from_yfinance("AAPL")
+
+    result = ingest_segments_edgar("AAPL")
 
     assert result["ticker"] == "AAPL"
+    assert result["source"] == "config_override"
+    assert result["segments_loaded"] == 20  # 5 segments × 4 annual periods
+
+    rows = con.execute(
+        "SELECT DISTINCT segment_name FROM segments WHERE ticker = 'AAPL' ORDER BY segment_name"
+    ).fetchall()
+    seg_names = {r[0] for r in rows}
+    assert seg_names == {"iPhone", "Services", "Mac", "iPad", "Wearables"}
+
+    print(f"  PASS: ingest_segments_edgar config fallback loaded {result['segments_loaded']} entries")
+    _teardown(con)
+
+
+@patch("data.ingest.requests.get", side_effect=_mock_requests_get_failure)
+@patch("data.ingest._load_config", return_value=_mock_config_no_overrides())
+@patch("data.ingest.init_db")
+@patch("data.ingest.yf")
+def test_ingest_segments_total_fallback(mock_yf, mock_init_db, mock_config, mock_requests):
+    """Test fallback to total-revenue-as-single-segment when both EDGAR and config fail."""
+    from data.ingest import ingest_segments_edgar
+
+    con = _setup()
+    mock_init_db.return_value = con
+    mock_yf.Ticker.return_value = _mock_ticker()
+
+    result = ingest_segments_edgar("AAPL")
+
+    assert result["ticker"] == "AAPL"
+    assert result["source"] == "total_fallback"
     assert result["segments_loaded"] == 4  # 4 annual periods
 
     rows = con.execute(
-        "SELECT period, revenue FROM segments WHERE ticker = 'AAPL' ORDER BY period"
+        "SELECT period, segment_name, revenue FROM segments "
+        "WHERE ticker = 'AAPL' ORDER BY period"
     ).fetchall()
     assert len(rows) == 4
-    for period, revenue in rows:
+    for period, seg_name, revenue in rows:
         assert period.startswith("FY")
+        assert seg_name == "Total"
         assert revenue > 0
 
-    print(f"  PASS: ingest_segments loaded {result['segments_loaded']} entries")
-    for period, revenue in rows:
+    print(f"  PASS: ingest_segments_edgar total fallback loaded {result['segments_loaded']} entries")
+    for period, seg_name, revenue in rows:
         print(f"         {period}: ${revenue/1e9:.1f}B")
     _teardown(con)
 
 
+@patch("data.ingest.requests.get", side_effect=_mock_requests_get_failure)
+@patch("data.ingest._load_config", return_value=_mock_config_no_overrides())
 @patch("data.ingest.init_db")
 @patch("data.ingest.yf")
-def test_ingest_all(mock_yf, mock_init_db):
+def test_ingest_all(mock_yf, mock_init_db, mock_config, mock_requests):
     from data.ingest import ingest_all
 
     con = _setup()
@@ -390,7 +593,9 @@ if __name__ == "__main__":
         ("ingest_price_data", test_ingest_price_data),
         ("ingest_price_data (upsert)", test_ingest_price_data_upsert),
         ("ingest_financials_from_yfinance", test_ingest_financials),
-        ("ingest_segments", test_ingest_segments),
+        ("ingest_segments_edgar (EDGAR)", test_ingest_segments_edgar),
+        ("ingest_segments_edgar (config fallback)", test_ingest_segments_config_fallback),
+        ("ingest_segments_edgar (total fallback)", test_ingest_segments_total_fallback),
         ("ingest_all", test_ingest_all),
     ]
 

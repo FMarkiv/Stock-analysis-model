@@ -1,12 +1,12 @@
 """
-Data ingestion from external sources (Yahoo Finance).
+Data ingestion from external sources (Yahoo Finance, SEC EDGAR).
 
 Functions
 ---------
-ingest_price_data          – daily OHLCV from yfinance  -> prices table
+ingest_price_data              – daily OHLCV from yfinance  -> prices table
 ingest_financials_from_yfinance – quarterly & annual statements -> financials table
-ingest_segments            – placeholder: total revenue as single segment -> segments table
-ingest_all                 – master driver that runs everything and prints a summary
+ingest_segments_edgar          – segment revenue from SEC EDGAR XBRL / config fallback -> segments table
+ingest_all                     – master driver that runs everything and prints a summary
 """
 
 import logging
@@ -15,6 +15,8 @@ import sys
 from datetime import datetime
 
 import pandas as pd
+import requests
+import yaml
 import yfinance as yf
 
 # Allow running as `python data/ingest.py` from the equity-model directory.
@@ -248,53 +250,280 @@ def ingest_financials_from_yfinance(ticker: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3. Segments (placeholder)
+# 3. Segments – SEC EDGAR XBRL with config-based fallback
 # ---------------------------------------------------------------------------
 
+_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.yaml")
 
-def ingest_segments(ticker: str) -> dict:
-    """Placeholder segment ingestion.
 
-    Pulls total revenue from the annual income statement and stores it as a
-    single 'Total' segment.  Will be enhanced later with real segment data.
-    """
-    logger.info("Fetching segment data for %s", ticker)
-
-    t = yf.Ticker(ticker)
-
-    con = init_db()
+def _load_config() -> dict:
+    """Load and return the project config.yaml as a dict."""
     try:
-        income = getattr(t, "income_stmt", None)
-        if income is None or income.empty:
-            logger.warning("No income data for segment extraction for %s", ticker)
-            return {"ticker": ticker, "segments_loaded": 0}
+        with open(_CONFIG_PATH) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        logger.warning("config.yaml not found at %s", _CONFIG_PATH)
+        return {}
 
-        loaded = 0
-        for date_col in income.columns:
-            period = _date_to_period(date_col, "annual")
 
-            if "Total Revenue" not in income.index:
-                logger.warning("Total Revenue not in income statement for %s", ticker)
-                break
+def _resolve_cik(ticker: str, user_agent: str) -> str | None:
+    """Resolve a stock ticker to a zero-padded SEC CIK string.
 
-            revenue = income.loc["Total Revenue", date_col]
-            if pd.isna(revenue):
+    Uses the SEC company tickers JSON endpoint.
+    """
+    url = "https://www.sec.gov/files/company_tickers.json"
+    headers = {"User-Agent": user_agent}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logger.warning("Failed to fetch SEC company tickers: %s", e)
+        return None
+
+    ticker_upper = ticker.upper()
+    for entry in data.values():
+        if entry.get("ticker", "").upper() == ticker_upper:
+            return str(entry["cik_str"]).zfill(10)
+
+    logger.warning("Ticker %s not found in SEC company tickers", ticker)
+    return None
+
+
+def _fetch_edgar_segments(
+    ticker: str, cik: str, user_agent: str,
+) -> list[dict] | None:
+    """Fetch segment revenue data from SEC EDGAR XBRL company facts.
+
+    Looks for revenue concepts that carry a segment dimension.
+    Returns a list of dicts ``{period, segment_name, revenue}`` or *None*
+    if segment data cannot be extracted.
+    """
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    headers = {"User-Agent": user_agent}
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        facts = resp.json()
+    except Exception as e:
+        logger.warning("Failed to fetch EDGAR company facts for %s: %s", ticker, e)
+        return None
+
+    us_gaap = facts.get("facts", {}).get("us-gaap", {})
+
+    # Revenue concepts to search, in priority order
+    revenue_concepts = [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+        "RevenueFromContractWithCustomerIncludingAssessedTax",
+    ]
+
+    segments: list[dict] = []
+
+    for concept in revenue_concepts:
+        concept_data = us_gaap.get(concept)
+        if concept_data is None:
+            continue
+
+        units = concept_data.get("units", {})
+        usd_facts = units.get("USD", [])
+
+        for fact in usd_facts:
+            # Segment-dimensioned facts include a "dimensions" or "segment"
+            # key that distinguishes them from the consolidated total.
+            dim = fact.get("dimensions", {})
+            seg_member = dim.get(
+                "srt:ProductOrServiceAxis",
+                dim.get(
+                    "us-gaap:StatementBusinessSegmentsAxis",
+                    dim.get("srt:ConsolidationItemsAxis"),
+                ),
+            )
+            if not seg_member:
                 continue
+
+            # Only use annual 10-K filings to match our period format
+            if fact.get("form") != "10-K":
+                continue
+
+            fy = fact.get("fy")
+            val = fact.get("val")
+            if fy is None or val is None:
+                continue
+
+            # fp == "FY" means full fiscal year (not a quarterly fragment)
+            if fact.get("fp") != "FY":
+                continue
+
+            # Clean up the segment member name
+            # e.g. "aapl:IPhoneMember" -> "IPhone"
+            seg_name = seg_member.split(":")[-1]
+            seg_name = seg_name.replace("Member", "").replace("Segment", "")
+
+            segments.append({
+                "period": f"FY{fy}",
+                "segment_name": seg_name,
+                "revenue": float(val),
+            })
+
+        if segments:
+            break  # Found segment data with this concept; stop searching
+
+    if not segments:
+        logger.info("No segment-dimensioned revenue found in EDGAR for %s", ticker)
+        return None
+
+    logger.info(
+        "Found %d segment-period entries from EDGAR for %s", len(segments), ticker,
+    )
+    return segments
+
+
+def _apply_segment_overrides(
+    ticker: str, con, config: dict,
+) -> int:
+    """Apply manual segment percentage overrides from config.yaml.
+
+    Reads total_revenue from the financials table for each annual period
+    and splits it according to the configured percentages.
+    Returns the number of segment rows inserted.
+    """
+    overrides = config.get("segment_overrides", {}).get(ticker.upper())
+    if not overrides:
+        logger.info("No segment overrides in config for %s", ticker)
+        return 0
+
+    # Get total revenue for each annual period
+    rows = con.execute(
+        """
+        SELECT period, value FROM financials
+        WHERE ticker = ? AND line_item = 'total_revenue'
+          AND period_type = 'annual' AND is_forecast = false
+          AND forecast_scenario = 'actual'
+        ORDER BY period
+        """,
+        [ticker],
+    ).fetchall()
+
+    if not rows:
+        logger.warning("No annual total_revenue in financials for %s; cannot apply overrides", ticker)
+        return 0
+
+    loaded = 0
+    for period, total_revenue in rows:
+        for seg in overrides:
+            seg_name = seg["name"]
+            seg_revenue = total_revenue * seg["revenue_pct"]
 
             con.execute(
                 """
                 INSERT INTO segments
                     (ticker, period, segment_name, revenue, is_forecast, forecast_scenario)
-                VALUES (?, ?, 'Total', ?, false, 'actual')
+                VALUES (?, ?, ?, ?, false, 'actual')
                 ON CONFLICT (ticker, period, segment_name, is_forecast, forecast_scenario)
                 DO UPDATE SET revenue = EXCLUDED.revenue
                 """,
-                [ticker, period, float(revenue)],
+                [ticker, period, seg_name, seg_revenue],
             )
             loaded += 1
 
-        logger.info("Loaded %d segment entries for %s", loaded, ticker)
-        return {"ticker": ticker, "segments_loaded": loaded}
+    logger.info("Applied %d segment override entries for %s", loaded, ticker)
+    return loaded
+
+
+def ingest_segments_edgar(ticker: str) -> dict:
+    """Ingest segment-level revenue data into the segments table.
+
+    Strategy (in order):
+    1. Fetch segment data from SEC EDGAR XBRL company facts API.
+    2. If EDGAR data is unavailable, fall back to manual percentage
+       overrides defined in config.yaml ``segment_overrides``.
+    3. If neither source provides data, store total revenue as a
+       single 'Total' segment (original fallback behaviour).
+    """
+    logger.info("Fetching segment data for %s", ticker)
+    config = _load_config()
+    user_agent = (
+        config.get("api_keys", {}).get("sec_edgar", {}).get("user_agent", "")
+    )
+
+    source = "none"
+    loaded = 0
+
+    # --- Strategy 1: SEC EDGAR XBRL -----------------------------------------
+    edgar_segments = None
+    if user_agent:
+        cik = _resolve_cik(ticker, user_agent)
+        if cik:
+            edgar_segments = _fetch_edgar_segments(ticker, cik, user_agent)
+
+    con = init_db()
+    try:
+        if edgar_segments:
+            source = "edgar"
+            for seg in edgar_segments:
+                con.execute(
+                    """
+                    INSERT INTO segments
+                        (ticker, period, segment_name, revenue,
+                         is_forecast, forecast_scenario)
+                    VALUES (?, ?, ?, ?, false, 'actual')
+                    ON CONFLICT (ticker, period, segment_name,
+                                 is_forecast, forecast_scenario)
+                    DO UPDATE SET revenue = EXCLUDED.revenue
+                    """,
+                    [ticker, seg["period"], seg["segment_name"], seg["revenue"]],
+                )
+                loaded += 1
+            logger.info(
+                "Loaded %d EDGAR segment entries for %s", loaded, ticker,
+            )
+        else:
+            # --- Strategy 2: Config overrides --------------------------------
+            loaded = _apply_segment_overrides(ticker, con, config)
+            if loaded > 0:
+                source = "config_override"
+            else:
+                # --- Strategy 3: Total revenue fallback ----------------------
+                source = "total_fallback"
+                t = yf.Ticker(ticker)
+                income = getattr(t, "income_stmt", None)
+                if income is not None and not income.empty:
+                    for date_col in income.columns:
+                        period = _date_to_period(date_col, "annual")
+                        if "Total Revenue" not in income.index:
+                            logger.warning(
+                                "Total Revenue not in income statement for %s",
+                                ticker,
+                            )
+                            break
+                        revenue = income.loc["Total Revenue", date_col]
+                        if pd.isna(revenue):
+                            continue
+                        con.execute(
+                            """
+                            INSERT INTO segments
+                                (ticker, period, segment_name, revenue,
+                                 is_forecast, forecast_scenario)
+                            VALUES (?, ?, 'Total', ?, false, 'actual')
+                            ON CONFLICT (ticker, period, segment_name,
+                                         is_forecast, forecast_scenario)
+                            DO UPDATE SET revenue = EXCLUDED.revenue
+                            """,
+                            [ticker, period, float(revenue)],
+                        )
+                        loaded += 1
+
+        logger.info(
+            "Segment ingestion for %s complete: %d entries (source: %s)",
+            ticker, loaded, source,
+        )
+        return {
+            "ticker": ticker,
+            "segments_loaded": loaded,
+            "source": source,
+        }
     finally:
         con.close()
 
@@ -368,11 +597,15 @@ def ingest_all(ticker: str) -> None:
         logger.exception("Financial ingestion failed for %s", ticker)
         fin_result = {"total_items_loaded": 0, "periods": 0, "missing_items": []}
 
-    # --- 3. Segments ------------------------------------------------------
+    # --- 3. Segments (EDGAR + config fallback) -----------------------------
     print("3. Segments...")
     try:
-        seg_result = ingest_segments(ticker)
-        print(f"   Loaded {seg_result['segments_loaded']} segment entries")
+        seg_result = ingest_segments_edgar(ticker)
+        source = seg_result.get("source", "unknown")
+        print(
+            f"   Loaded {seg_result['segments_loaded']} segment entries "
+            f"(source: {source})"
+        )
     except Exception as e:
         print(f"   Segment data failed: {e}")
         logger.exception("Segment ingestion failed for %s", ticker)

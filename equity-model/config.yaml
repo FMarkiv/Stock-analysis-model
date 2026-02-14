@@ -2,7 +2,10 @@
 
 api_keys:
   sec_edgar:
-    user_agent: "YourName your.email@example.com"  # SEC requires a user-agent with contact info
+    # SEC EDGAR requires a User-Agent header with your name and email.
+    # Requests without a valid User-Agent are blocked.
+    # Format: "FirstName LastName email@example.com"
+    user_agent: "YourName your.email@example.com"
   fred:
     api_key: "YOUR_FRED_API_KEY"
 
@@ -25,3 +28,21 @@ scenarios:
   bear:
     revenue_growth: 0.03
     margin_expansion: -0.02
+
+# Manual segment revenue overrides.
+# Used as a fallback when SEC EDGAR XBRL segment data is unavailable or
+# cannot be parsed.  Each segment's revenue_pct is applied to total revenue
+# from the financials table to compute segment-level revenue.
+# Percentages should sum to ~1.0.
+segment_overrides:
+  AAPL:
+    - name: iPhone
+      revenue_pct: 0.52
+    - name: Services
+      revenue_pct: 0.22
+    - name: Mac
+      revenue_pct: 0.10
+    - name: iPad
+      revenue_pct: 0.08
+    - name: Wearables
+      revenue_pct: 0.08
