@@ -1,0 +1,27 @@
+# Equity Model Configuration
+
+api_keys:
+  sec_edgar:
+    user_agent: "YourName your.email@example.com"  # SEC requires a user-agent with contact info
+  fred:
+    api_key: "YOUR_FRED_API_KEY"
+
+database:
+  path: "data/equity.duckdb"
+
+model_parameters:
+  risk_free_rate: 0.043        # 10-year Treasury yield
+  equity_risk_premium: 0.055   # long-run ERP estimate
+  terminal_growth_rate: 0.025  # perpetuity growth rate
+  tax_rate: 0.21               # US federal corporate rate
+
+scenarios:
+  base:
+    revenue_growth: 0.08
+    margin_expansion: 0.0
+  bull:
+    revenue_growth: 0.12
+    margin_expansion: 0.02
+  bear:
+    revenue_growth: 0.03
+    margin_expansion: -0.02
