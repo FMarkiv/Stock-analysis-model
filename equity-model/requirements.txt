@@ -3,5 +3,6 @@ yfinance
 requests
 pyyaml
 pandas
+numpy
 plotly
 rich
