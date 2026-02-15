@@ -242,20 +242,21 @@ def seed():
     """Insert AAPL test data into DuckDB."""
     con = init_db()
     try:
+        now = datetime.now()
+
         # Company
         con.execute(
             """
-            INSERT INTO company (ticker, name, sector, currency, fiscal_year_end)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO company (ticker, name, sector, currency, fiscal_year_end, last_ingested)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT (ticker) DO UPDATE SET
                 name = EXCLUDED.name,
                 sector = EXCLUDED.sector,
-                fiscal_year_end = EXCLUDED.fiscal_year_end
+                fiscal_year_end = EXCLUDED.fiscal_year_end,
+                last_ingested = EXCLUDED.last_ingested
             """,
-            list(COMPANY),
+            list(COMPANY) + [now],
         )
-
-        now = datetime.now()
 
         # Income statement
         for period, items in INCOME_DATA.items():

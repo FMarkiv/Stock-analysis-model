@@ -1,4 +1,7 @@
 # Equity Model Configuration
+# --------------------------
+# Copy this file, fill in your API keys, and keep it in the project root.
+# The model reads it on startup via config.yaml.
 
 api_keys:
   sec_edgar:
@@ -45,4 +48,20 @@ segment_overrides:
     - name: iPad
       revenue_pct: 0.08
     - name: Wearables
+      revenue_pct: 0.08
+
+  MSFT:
+    - name: Intelligent Cloud
+      revenue_pct: 0.43
+    - name: Productivity and Business Processes
+      revenue_pct: 0.33
+    - name: More Personal Computing
+      revenue_pct: 0.24
+
+  TSLA:
+    - name: Automotive
+      revenue_pct: 0.82
+    - name: Energy Generation and Storage
+      revenue_pct: 0.10
+    - name: Services and Other
       revenue_pct: 0.08

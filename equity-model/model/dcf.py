@@ -3,8 +3,23 @@ Discounted cash-flow valuation engine.
 
 Provides ``DCFValuation`` for WACC calculation, DCF valuation,
 sensitivity analysis, and relative-multiples valuation.
+
+This module implements a full equity valuation workflow:
+
+1. **WACC calculation** via CAPM beta regression and balance-sheet data.
+2. **DCF valuation** using projected unlevered free cash flows, with both
+   perpetuity-growth and exit-multiple terminal value approaches.
+3. **Sensitivity analysis** producing a 2-D table of implied share prices
+   across varying WACC / terminal-growth / exit-multiple assumptions.
+4. **Relative-multiples valuation** using trailing Forward P/E, EV/EBITDA,
+   and Price/FCF multiples applied to Year-1 forecast estimates.
+
+The engine is designed to degrade gracefully when data is missing or
+earnings are negative, returning partial results with warning flags
+rather than raising exceptions.
 """
 
+import logging
 import os
 import sys
 
@@ -19,13 +34,22 @@ if _PROJECT_ROOT not in sys.path:
 from db.schema import get_connection, init_db  # noqa: E402
 from model.statements import FinancialModel, _sort_periods, _safe_div, _fy_year  # noqa: E402
 
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Load config.yaml from the project root."""
+    """Load ``config.yaml`` from the project root.
+
+    Returns
+    -------
+    dict
+        Parsed configuration dictionary, or an empty dict if the file
+        is not found.
+    """
     config_path = os.path.join(_PROJECT_ROOT, "config.yaml")
     try:
         with open(config_path) as f:
@@ -41,6 +65,14 @@ def _load_config() -> dict:
 
 class DCFValuation:
     """Discounted Cash Flow valuation model.
+
+    Orchestrates WACC computation, multi-year DCF projection, sensitivity
+    analysis, and relative-multiples valuation for a single equity ticker.
+
+    The model pulls historical financial statements from a DuckDB database,
+    builds a 3-statement forecast via :class:`model.statements.FinancialModel`,
+    and then values the equity using both intrinsic (DCF) and relative
+    (multiples) approaches.
 
     Parameters
     ----------
@@ -78,6 +110,11 @@ class DCFValuation:
 
     def compute_wacc(self) -> dict:
         """Calculate Weighted Average Cost of Capital.
+
+        Uses CAPM for cost of equity (risk-free rate + beta * ERP) and
+        the ratio of interest expense to total debt for cost of debt.
+        Capital-structure weights are derived from market capitalisation
+        (preferred) or book equity as a fallback.
 
         Returns
         -------
@@ -214,8 +251,24 @@ class DCFValuation:
     def _compute_beta(self, years: int = 2) -> float:
         """Regression beta of weekly returns vs SPY over *years* years.
 
-        Falls back to 1.0 if fewer than 20 weekly observations are
-        available for either the ticker or SPY.
+        Computes the slope coefficient from a simple OLS regression of the
+        ticker's weekly returns on SPY's weekly returns, using Friday-close
+        resampled prices.
+
+        Falls back to 1.0 if fewer than 20 weekly observations of
+        overlapping data are available for either the ticker or SPY, and
+        logs a warning.
+
+        Parameters
+        ----------
+        years : int
+            Number of years of historical price data to use.
+
+        Returns
+        -------
+        float
+            Estimated beta coefficient.  Returns ``1.0`` as a safe default
+            when insufficient data is available.
         """
         con = get_connection(self.db_path)
         try:
@@ -231,6 +284,11 @@ class DCFValuation:
             con.close()
 
         if ticker_prices.empty or spy_prices.empty:
+            logger.warning(
+                "%s: No price data for %s or SPY; defaulting beta to 1.0",
+                self.ticker,
+                self.ticker if ticker_prices.empty else "SPY",
+            )
             return 1.0
 
         # Convert to weekly (Friday close)
@@ -248,18 +306,34 @@ class DCFValuation:
 
         common = tk.index.intersection(sp.index)
         if len(common) < 20:
+            logger.warning(
+                "%s: Only %d overlapping weekly observations (need 20); "
+                "defaulting beta to 1.0",
+                self.ticker,
+                len(common),
+            )
             return 1.0
 
         tk_ret = tk[common].pct_change().dropna()
         sp_ret = sp[common].pct_change().dropna()
         common_ret = tk_ret.index.intersection(sp_ret.index)
         if len(common_ret) < 20:
+            logger.warning(
+                "%s: Only %d overlapping return observations (need 20); "
+                "defaulting beta to 1.0",
+                self.ticker,
+                len(common_ret),
+            )
             return 1.0
 
         x = sp_ret[common_ret].values
         y = tk_ret[common_ret].values
         cov = np.cov(x, y)
         if cov[0, 0] == 0:
+            logger.warning(
+                "%s: SPY variance is zero; defaulting beta to 1.0",
+                self.ticker,
+            )
             return 1.0
 
         return float(cov[0, 1] / cov[0, 0])
@@ -269,7 +343,15 @@ class DCFValuation:
     # ------------------------------------------------------------------
 
     def _get_market_cap(self) -> float | None:
-        """Most-recent price * diluted shares outstanding."""
+        """Most-recent price multiplied by diluted shares outstanding.
+
+        Returns
+        -------
+        float or None
+            Market capitalisation in the same currency unit as the
+            financial statements, or ``None`` if price or share-count
+            data is unavailable.
+        """
         con = get_connection(self.db_path)
         try:
             row = con.execute(
@@ -292,7 +374,16 @@ class DCFValuation:
         return None
 
     def _get_current_price(self) -> float:
-        """Return the most-recent closing price from the DB."""
+        """Return the most-recent closing price from the database.
+
+        If no price data exists for the ticker, returns ``0.0`` and logs
+        a warning instead of raising an exception.
+
+        Returns
+        -------
+        float
+            Most-recent closing price, or ``0.0`` if unavailable.
+        """
         con = get_connection(self.db_path)
         try:
             row = con.execute(
@@ -304,11 +395,26 @@ class DCFValuation:
             con.close()
 
         if row is None:
-            raise ValueError(f"No price data found for {self.ticker}")
+            logger.warning(
+                "%s: No price data found; returning 0.0 as current price",
+                self.ticker,
+            )
+            return 0.0
         return row[0]
 
     def _get_balance_sheet_items(self) -> dict:
-        """Extract latest total_debt, cash, net_debt, diluted_shares."""
+        """Extract latest total_debt, cash, net_debt, and diluted_shares.
+
+        Missing balance-sheet line items (e.g. ``short_term_debt`` for
+        companies that have none) are defaulted to ``0.0`` rather than
+        causing a ``KeyError``.
+
+        Returns
+        -------
+        dict
+            Keys: ``total_debt``, ``cash``, ``net_debt``,
+            ``diluted_shares``.
+        """
         bal = self.model.historical.get("balance", pd.DataFrame())
         inc = self.model.historical.get("income", pd.DataFrame())
 
@@ -319,11 +425,15 @@ class DCFValuation:
                 if item in bal.index:
                     s = bal.loc[item].dropna()
                     if len(s) > 0:
-                        total_debt += float(s.iloc[-1])
+                        val = s.iloc[-1]
+                        total_debt += float(val) if pd.notna(val) else 0.0
+                # If the item is missing from the index, it simply
+                # contributes 0 -- no error raised.
             if "cash_and_equivalents" in bal.index:
                 c = bal.loc["cash_and_equivalents"].dropna()
                 if len(c) > 0:
-                    cash = float(c.iloc[-1])
+                    val = c.iloc[-1]
+                    cash = float(val) if pd.notna(val) else 0.0
 
         shares = 15_000_000_000.0
         if not inc.empty and "diluted_shares_out" in inc.index:
@@ -345,6 +455,22 @@ class DCFValuation:
     def dcf_valuation(self, scenario: str = "base") -> dict:
         """Run a standard DCF valuation.
 
+        Projects unlevered free cash flows (UFCF) from the 3-statement
+        model, discounts them at WACC, and computes terminal value using
+        both the perpetuity-growth and exit-multiple methods.  The final
+        enterprise value is the average of the two TV approaches.
+
+        **Robustness features:**
+
+        * If all projected FCFs are negative the result is flagged with
+          ``dcf_valid = False`` and a warning message; ``implied_price``
+          is set to ``0``.
+        * If ``WACC <= terminal_growth``, the WACC is automatically
+          increased by 1 percentage point (or terminal growth reduced)
+          to prevent division by zero in the perpetuity formula.
+        * If equity value is negative, ``implied_price`` is set to ``0``
+          with a warning flag.
+
         Parameters
         ----------
         scenario : str
@@ -354,8 +480,9 @@ class DCFValuation:
         -------
         dict
             ``implied_price``, ``current_price``, ``upside_downside``,
-            ``enterprise_value``, ``equity_value``, plus detailed
-            intermediate results.
+            ``enterprise_value``, ``equity_value``, ``dcf_valid``,
+            optionally ``dcf_warning``, plus detailed intermediate
+            results.
         """
         # Ensure WACC is available
         if self._wacc_result is None:
@@ -364,6 +491,31 @@ class DCFValuation:
         wacc = self._wacc_result["wacc"]
         tax_rate = self._wacc_result["tax_rate"]
         terminal_growth = self.model_params.get("terminal_growth_rate", 0.025)
+
+        # --- Guard: WACC must exceed terminal growth for perpetuity ---
+        warnings_list: list[str] = []
+        if wacc <= terminal_growth:
+            original_wacc = wacc
+            original_tg = terminal_growth
+            # Try increasing WACC by 1pp first
+            wacc = wacc + 0.01
+            if wacc <= terminal_growth:
+                # Also reduce terminal growth so the spread is at least 1pp
+                terminal_growth = wacc - 0.01
+            logger.warning(
+                "%s: WACC (%.4f) <= terminal_growth (%.4f); adjusted to "
+                "WACC=%.4f, terminal_growth=%.4f",
+                self.ticker,
+                original_wacc,
+                original_tg,
+                wacc,
+                terminal_growth,
+            )
+            warnings_list.append(
+                f"WACC ({original_wacc:.4f}) <= terminal_growth "
+                f"({original_tg:.4f}); auto-adjusted to WACC={wacc:.4f}, "
+                f"terminal_growth={terminal_growth:.4f}"
+            )
 
         # Ensure forecast exists for the requested scenario
         if scenario not in self._forecasts:
@@ -374,10 +526,10 @@ class DCFValuation:
         forecast_periods = _sort_periods(list(forecast.columns))
 
         # ---- Project unlevered FCF ----
-        # UFCF = EBIT*(1-t) + D&A - CapEx - ΔWC
+        # UFCF = EBIT*(1-t) + D&A - CapEx - delta-WC
         # In our storage: capex is negative, change_in_working_capital
         # encodes the cash-flow impact (negative = WC increase = cash used).
-        # So: UFCF = EBIT*(1-t) + D&A + capex_stored + Δwc_stored
+        # So: UFCF = EBIT*(1-t) + D&A + capex_stored + delta-wc_stored
         projected_fcfs: dict[str, float] = {}
         for period in forecast_periods:
             ebit = float(forecast.at["operating_income", period]) if "operating_income" in forecast.index else 0.0
@@ -387,6 +539,15 @@ class DCFValuation:
 
             ufcf = ebit * (1 - tax_rate) + da + capex + dwc
             projected_fcfs[period] = ufcf
+
+        # --- Check if all projected FCFs are negative ---
+        dcf_valid = True
+        all_fcfs_negative = all(v < 0 for v in projected_fcfs.values()) if projected_fcfs else True
+        if all_fcfs_negative:
+            dcf_valid = False
+            neg_warning = "All projected FCFs are negative; DCF valuation unreliable"
+            warnings_list.append(neg_warning)
+            logger.warning("%s: %s", self.ticker, neg_warning)
 
         # ---- Discount projected FCFs ----
         pv_fcfs = 0.0
@@ -398,14 +559,14 @@ class DCFValuation:
         n_years = len(forecast_periods)
         final_fcf = fcf_values[-1] if fcf_values else 0.0
 
-        # ---- Terminal value – perpetuity growth ----
+        # ---- Terminal value -- perpetuity growth ----
         if wacc > terminal_growth:
             tv_perpetuity = final_fcf * (1 + terminal_growth) / (wacc - terminal_growth)
         else:
             tv_perpetuity = final_fcf * 25  # safety cap
         pv_tv_perpetuity = tv_perpetuity / (1 + wacc) ** n_years
 
-        # ---- Terminal value – exit multiple ----
+        # ---- Terminal value -- exit multiple ----
         exit_multiple = self.model_params.get("exit_ebitda_multiple", 12.0)
         terminal_ebitda = (
             float(forecast.at["ebitda", forecast_periods[-1]])
@@ -423,18 +584,29 @@ class DCFValuation:
         # ---- Bridge to equity value ----
         bs = self._get_balance_sheet_items()
         equity_value = enterprise_value - bs["net_debt"]
-        implied_price = equity_value / bs["diluted_shares"] if bs["diluted_shares"] > 0 else 0.0
 
-        try:
-            current_price = self._get_current_price()
-        except ValueError:
-            current_price = 0.0
+        # --- Handle negative equity value ---
+        if equity_value < 0:
+            implied_price = 0.0
+            eq_warning = (
+                f"Equity value is negative ({equity_value:,.0f}); "
+                "implied price set to 0"
+            )
+            warnings_list.append(eq_warning)
+            logger.warning("%s: %s", self.ticker, eq_warning)
+        elif all_fcfs_negative:
+            # All FCFs negative: set price to 0 but still return results
+            implied_price = 0.0
+        else:
+            implied_price = equity_value / bs["diluted_shares"] if bs["diluted_shares"] > 0 else 0.0
+
+        current_price = self._get_current_price()
 
         upside_downside = (
             (implied_price / current_price - 1) if current_price > 0 else 0.0
         )
 
-        return {
+        result = {
             "implied_price": implied_price,
             "current_price": current_price,
             "upside_downside": upside_downside,
@@ -454,7 +626,13 @@ class DCFValuation:
             "cash": bs["cash"],
             "diluted_shares": bs["diluted_shares"],
             "projected_fcfs": projected_fcfs,
+            "dcf_valid": dcf_valid,
         }
+
+        if warnings_list:
+            result["dcf_warning"] = "; ".join(warnings_list)
+
+        return result
 
     # ------------------------------------------------------------------
     # 4. sensitivity_table
@@ -468,6 +646,11 @@ class DCFValuation:
         range2: tuple = (-0.02, 0.02, 0.005),
     ) -> pd.DataFrame:
         """2-D sensitivity table of implied share price.
+
+        Produces a matrix of implied share prices by varying two model
+        parameters around their base-case values.  Each cell is computed
+        via :meth:`_quick_dcf`, which re-discounts the base-case FCFs
+        under the perturbed parameters.
 
         Parameters
         ----------
@@ -533,6 +716,19 @@ class DCFValuation:
         Re-uses projected FCFs from the base run and only recalculates
         the discounting / terminal-value step, making it suitable for
         sensitivity and Monte Carlo loops.
+
+        Parameters
+        ----------
+        base_dcf : dict
+            Result dictionary from a prior :meth:`dcf_valuation` call.
+        **overrides
+            Parameter overrides.  Supported keys: ``wacc``,
+            ``terminal_growth``, ``exit_multiple``.
+
+        Returns
+        -------
+        float
+            Implied share price under the overridden assumptions.
         """
         wacc = overrides.get("wacc", base_dcf["wacc"])
         tg = overrides.get("terminal_growth", base_dcf["terminal_growth"])
@@ -583,18 +779,31 @@ class DCFValuation:
         trailing 5-year average multiples for this stock applied to
         forecast Year-1 estimates.
 
+        **Robustness features:**
+
+        * If forward EPS is zero or negative, the P/E method is skipped.
+        * If forecast EBITDA is zero or negative, the EV/EBITDA method
+          is skipped.
+        * If forecast FCF is zero or negative, the Price/FCF method is
+          skipped.
+        * Whatever methods are valid are returned.  An empty ``methods``
+          dict is possible if all inputs are non-positive.
+
         Returns
         -------
         dict
-            ``forward_pe``, ``ev_ebitda``, ``price_fcf`` (each a dict
-            with ``hist_avg_multiple``, implied inputs, and
-            ``implied_price``), plus ``current_price``.
+            ``methods`` sub-dict containing whichever of ``forward_pe``,
+            ``ev_ebitda``, ``price_fcf`` are valid (each a dict with
+            ``hist_avg_multiple``, implied inputs, and
+            ``implied_price``), plus ``current_price`` and
+            ``multiples_warning`` if any methods were skipped.
         """
         inc = self.model.historical.get("income", pd.DataFrame())
         cf = self.model.historical.get("cashflow", pd.DataFrame())
         bal = self.model.historical.get("balance", pd.DataFrame())
 
         if inc.empty:
+            logger.warning("%s: No income data; cannot compute multiples", self.ticker)
             return {}
 
         hist_periods = _sort_periods(list(inc.columns))
@@ -664,6 +873,10 @@ class DCFValuation:
         # --- Forecast Year-1 values ---
         forecast = self._forecasts.get("base")
         if forecast is None or forecast.empty:
+            logger.warning(
+                "%s: No base forecast available for multiples valuation",
+                self.ticker,
+            )
             return {}
 
         y1 = _sort_periods(list(forecast.columns))[0]
@@ -685,39 +898,107 @@ class DCFValuation:
         )
 
         bs = self._get_balance_sheet_items()
+        current_price = self._get_current_price()
 
-        implied_pe = avg_pe * forecast_eps if forecast_eps > 0 else 0.0
+        # --- Build result with only valid methods ---
+        methods: dict[str, dict] = {}
+        skipped: list[str] = []
 
-        implied_ev = avg_ev_ebitda * forecast_ebitda
-        implied_ev_ebitda_price = (
-            (implied_ev - bs["net_debt"]) / bs["diluted_shares"]
-            if bs["diluted_shares"] > 0
-            else 0.0
-        )
-
-        fcf_per_share = forecast_fcf / bs["diluted_shares"] if bs["diluted_shares"] > 0 else 0.0
-        implied_p_fcf = avg_p_fcf * fcf_per_share
-
-        try:
-            current_price = self._get_current_price()
-        except ValueError:
-            current_price = 0.0
-
-        return {
-            "forward_pe": {
+        # Forward P/E -- skip if EPS <= 0
+        if forecast_eps > 0:
+            implied_pe = avg_pe * forecast_eps
+            methods["forward_pe"] = {
                 "hist_avg_multiple": round(avg_pe, 1),
                 "forecast_eps": round(forecast_eps, 2),
                 "implied_price": round(implied_pe, 2),
-            },
-            "ev_ebitda": {
+            }
+        else:
+            skipped.append(
+                f"Forward P/E skipped (EPS={forecast_eps:.2f})"
+            )
+            logger.info(
+                "%s: Forward P/E skipped because forecast EPS (%.2f) is "
+                "zero or negative",
+                self.ticker,
+                forecast_eps,
+            )
+
+        # EV/EBITDA -- skip if EBITDA <= 0
+        if forecast_ebitda > 0:
+            implied_ev = avg_ev_ebitda * forecast_ebitda
+            implied_ev_ebitda_price = (
+                (implied_ev - bs["net_debt"]) / bs["diluted_shares"]
+                if bs["diluted_shares"] > 0
+                else 0.0
+            )
+            methods["ev_ebitda"] = {
                 "hist_avg_multiple": round(avg_ev_ebitda, 1),
                 "forecast_ebitda": forecast_ebitda,
                 "implied_price": round(implied_ev_ebitda_price, 2),
-            },
-            "price_fcf": {
+            }
+        else:
+            skipped.append(
+                f"EV/EBITDA skipped (EBITDA={forecast_ebitda:,.0f})"
+            )
+            logger.info(
+                "%s: EV/EBITDA skipped because forecast EBITDA (%.0f) is "
+                "zero or negative",
+                self.ticker,
+                forecast_ebitda,
+            )
+
+        # Price/FCF -- skip if FCF <= 0
+        if forecast_fcf > 0:
+            fcf_per_share = (
+                forecast_fcf / bs["diluted_shares"]
+                if bs["diluted_shares"] > 0
+                else 0.0
+            )
+            implied_p_fcf = avg_p_fcf * fcf_per_share
+            methods["price_fcf"] = {
                 "hist_avg_multiple": round(avg_p_fcf, 1),
                 "forecast_fcf_per_share": round(fcf_per_share, 2),
                 "implied_price": round(implied_p_fcf, 2),
-            },
+            }
+        else:
+            skipped.append(
+                f"Price/FCF skipped (FCF={forecast_fcf:,.0f})"
+            )
+            logger.info(
+                "%s: Price/FCF skipped because forecast FCF (%.0f) is "
+                "zero or negative",
+                self.ticker,
+                forecast_fcf,
+            )
+
+        result: dict = {
+            "forward_pe": methods.get("forward_pe", {
+                "hist_avg_multiple": round(avg_pe, 1),
+                "forecast_eps": round(forecast_eps, 2),
+                "implied_price": 0.0,
+                "skipped": True,
+            }),
+            "ev_ebitda": methods.get("ev_ebitda", {
+                "hist_avg_multiple": round(avg_ev_ebitda, 1),
+                "forecast_ebitda": forecast_ebitda,
+                "implied_price": 0.0,
+                "skipped": True,
+            }),
+            "price_fcf": methods.get("price_fcf", {
+                "hist_avg_multiple": round(avg_p_fcf, 1),
+                "forecast_fcf_per_share": round(
+                    forecast_fcf / bs["diluted_shares"]
+                    if bs["diluted_shares"] > 0
+                    else 0.0,
+                    2,
+                ),
+                "implied_price": 0.0,
+                "skipped": True,
+            }),
             "current_price": current_price,
         }
+
+        if skipped:
+            result["multiples_warning"] = "; ".join(skipped)
+
+        return result

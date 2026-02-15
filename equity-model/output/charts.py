@@ -4,8 +4,27 @@ Charting and visualisation utilities using Plotly.
 Provides interactive charts for equity model analysis including:
 revenue bridges, margin trends, DCF waterfalls, sensitivity heatmaps,
 Monte Carlo distributions, scenario comparisons, and football field charts.
+
+Each public chart function returns a :class:`plotly.graph_objects.Figure`
+instance that can be rendered in a notebook, saved to HTML, or embedded
+in a larger report via :func:`generate_full_report`.
+
+Graceful degradation
+--------------------
+All chart functions are designed to degrade gracefully when underlying
+data is missing or incomplete:
+
+* ``revenue_bridge`` falls back to a year-over-year waterfall when segment
+  data is unavailable.
+* ``margin_trends`` skips the forecast shading region when no forecast
+  periods exist (e.g. the model was never run).
+* ``football_field`` tolerates zero or invalid DCF / multiples valuations
+  and renders only the methods that produced valid results.
+* ``generate_full_report`` wraps every sub-chart in a ``try``/``except``
+  so that a single failing visualisation does not abort the whole report.
 """
 
+import logging
 import os
 import sys
 from datetime import datetime
@@ -14,6 +33,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -46,13 +67,26 @@ TEMPLATE = "plotly_white"
 
 
 def _fmt_b(val):
-    """Format a value in billions."""
+    """Format a numeric value as a dollar amount in billions.
+
+    Parameters
+    ----------
+    val : float or None
+        Value in raw units (e.g. 1_500_000_000).
+
+    Returns
+    -------
+    str
+        Formatted string such as ``"$1.5B"``, or ``""`` if *val* is
+        ``None`` or ``NaN``.
+    """
     if val is None or (isinstance(val, float) and np.isnan(val)):
         return ""
     return f"${val / 1e9:.1f}B"
 
 
 def _resolve_db(db_path):
+    """Return *db_path* if provided, otherwise fall back to the project default."""
     return db_path or _DEFAULT_DB
 
 
@@ -62,10 +96,32 @@ def _resolve_db(db_path):
 
 
 def revenue_bridge(ticker, db_path=None, scenario="base"):
-    """Waterfall chart showing revenue progression from last actual year
-    through forecast years, broken down by segment if available.
+    """Build a waterfall chart showing revenue progression.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    The chart walks from the last actual fiscal year through forecast
+    years.  When segment-level revenue data is available the waterfall
+    decomposes each year-over-year change by segment; otherwise it shows
+    simple year-over-year deltas.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.  Defaults to the project-level
+        ``data/equity.duckdb``.
+    scenario : str
+        Forecast scenario name (``"base"``, ``"bull"``, or ``"bear"``).
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive waterfall chart.
+
+    Notes
+    -----
+    If segment data is empty the function still produces a valid chart
+    using total-revenue year-over-year changes only.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -92,26 +148,50 @@ def revenue_bridge(ticker, db_path=None, scenario="base"):
     revenues = [float(inc.at["total_revenue", p]) for p in display_periods]
 
     # Check for segment data
-    con = get_connection(db)
+    has_segments = False
+    seg_all = pd.DataFrame()
+    segment_names = []
     try:
-        seg_df = con.execute(
-            "SELECT period, segment_name, revenue, is_forecast, forecast_scenario "
-            "FROM segments WHERE ticker = ? ORDER BY period, segment_name",
-            [ticker],
-        ).fetchdf()
-    finally:
-        con.close()
+        con = get_connection(db)
+        try:
+            seg_df = con.execute(
+                "SELECT period, segment_name, revenue, is_forecast, forecast_scenario "
+                "FROM segments WHERE ticker = ? ORDER BY period, segment_name",
+                [ticker],
+            ).fetchdf()
+        finally:
+            con.close()
 
-    has_segments = not seg_df.empty
+        has_segments = not seg_df.empty
+
+        if has_segments:
+            seg_actual = seg_df[~seg_df["is_forecast"]]
+            seg_forecast = seg_df[
+                seg_df["is_forecast"] & (seg_df["forecast_scenario"] == scenario)
+            ]
+            seg_all = pd.concat([seg_actual, seg_forecast])
+            segment_names = sorted(seg_all["segment_name"].unique())
+
+            # If we got a dataframe back but it contains no rows relevant to
+            # our display periods treat it as "no segments".
+            relevant = seg_all[seg_all["period"].isin(display_periods)]
+            if relevant.empty:
+                has_segments = False
+                logger.info(
+                    "%s: segment table exists but has no rows for the "
+                    "display periods; falling back to YoY waterfall.",
+                    ticker,
+                )
+    except Exception:
+        has_segments = False
+        logger.info(
+            "%s: unable to query segment data; falling back to "
+            "year-over-year revenue waterfall.",
+            ticker,
+            exc_info=True,
+        )
 
     if has_segments:
-        seg_actual = seg_df[~seg_df["is_forecast"]]
-        seg_forecast = seg_df[
-            seg_df["is_forecast"] & (seg_df["forecast_scenario"] == scenario)
-        ]
-        seg_all = pd.concat([seg_actual, seg_forecast])
-        segment_names = sorted(seg_all["segment_name"].unique())
-
         x_labels, y_values, measures, text_vals = [], [], [], []
 
         # Starting bar: last actual total
@@ -222,10 +302,26 @@ def revenue_bridge(ticker, db_path=None, scenario="base"):
 
 
 def margin_trends(ticker, db_path=None, scenario="base"):
-    """Line chart of gross, operating, net, and FCF margins over
-    historical + forecast periods.  The forecast region is shaded.
+    """Line chart of gross, operating, net, and FCF margins.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    Historical and forecast periods are plotted together.  When forecast
+    data is present the forecast region is highlighted with a shaded
+    background; if no forecast periods exist (e.g. the model was never
+    run) the chart is rendered without shading.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+    scenario : str
+        Forecast scenario name.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive line chart.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -299,8 +395,9 @@ def margin_trends(ticker, db_path=None, scenario="base"):
             )
         )
 
-    # Shade forecast region
-    if hist_periods and len(hist_periods) < len(all_periods):
+    # Shade forecast region -- only when forecast data actually exists.
+    fc_periods = [p for p in all_periods if p not in hist_periods]
+    if hist_periods and fc_periods:
         fig.add_vrect(
             x0=hist_periods[-1],
             x1=all_periods[-1],
@@ -309,6 +406,17 @@ def margin_trends(ticker, db_path=None, scenario="base"):
             line_width=0,
             annotation_text="Forecast",
             annotation_position="top right",
+        )
+    elif not hist_periods:
+        logger.info(
+            "%s: no historical periods detected; skipping forecast shading.",
+            ticker,
+        )
+    elif not fc_periods:
+        logger.info(
+            "%s: no forecast periods detected (model may not have been run); "
+            "skipping forecast shading.",
+            ticker,
         )
 
     fig.update_layout(
@@ -331,10 +439,24 @@ def margin_trends(ticker, db_path=None, scenario="base"):
 
 
 def three_statement_summary(ticker, db_path=None, scenario="base"):
-    """Dashboard-style layout with four panels:
-    Revenue + growth, EPS, FCF, and Net Debt / EBITDA.
+    """Dashboard-style layout with four panels.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    The panels display Revenue + growth, EPS, FCF, and Net Debt / EBITDA
+    across all historical and forecast periods.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+    scenario : str
+        Forecast scenario name.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive multi-panel figure.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -532,10 +654,25 @@ def three_statement_summary(ticker, db_path=None, scenario="base"):
 
 
 def dcf_waterfall(ticker, db_path=None, scenario="base"):
-    """Waterfall chart: PV of FCFs -> terminal value -> enterprise value
-    -> minus debt -> plus cash -> equity value, with per-share annotation.
+    """Waterfall chart of the DCF bridge to equity value.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    Steps: PV of FCFs -> terminal value -> enterprise value -> minus
+    debt -> plus cash -> equity value, with an annotation showing the
+    implied share price and upside/downside vs the current market price.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+    scenario : str
+        Forecast scenario name.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive waterfall chart.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -625,9 +762,22 @@ def dcf_waterfall(ticker, db_path=None, scenario="base"):
 
 def sensitivity_heatmap(ticker, db_path=None):
     """Heatmap of the 2-D sensitivity table (terminal growth vs WACC).
-    Green = undervalued vs current price, red = overvalued.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    Cells are coloured green when the implied share price exceeds the
+    current market price (undervalued) and red when it falls below
+    (overvalued).
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive heatmap.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -690,10 +840,23 @@ def sensitivity_heatmap(ticker, db_path=None):
 
 
 def monte_carlo_distribution(ticker, db_path=None):
-    """Histogram of Monte Carlo simulated fair values with vertical lines
-    for current price and key percentile markers.
+    """Histogram of Monte Carlo simulated fair values.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    Vertical lines mark the current market price and key percentiles
+    (P10, P25, P50, P75, P90).  A summary annotation shows the mean,
+    standard deviation, and the 10th-to-90th percentile range.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive histogram.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -784,10 +947,22 @@ def monte_carlo_distribution(ticker, db_path=None):
 
 
 def scenario_comparison(ticker, db_path=None):
-    """Grouped bar chart comparing bull / base / bear on key metrics:
-    revenue, EPS, FCF, and implied price.
+    """Grouped bar chart comparing bull / base / bear scenarios.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    Key metrics shown are revenue, EPS, FCF, and implied share price
+    for the first forecast year.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive grouped-bar chart.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -890,11 +1065,33 @@ def scenario_comparison(ticker, db_path=None):
 
 
 def football_field(ticker, db_path=None):
-    """Horizontal bar chart showing valuation range from each method
-    (DCF, P/E, EV/EBITDA, P/FCF, Monte Carlo 10th–90th) with
-    current price as a vertical line.
+    """Horizontal bar chart showing valuation range from each method.
 
-    Returns a :class:`plotly.graph_objects.Figure`.
+    Methods included (when valid data is available):
+
+    * **DCF** -- bear-to-bull implied price range.
+    * **Forward P/E** -- point estimate with a +/-15% band.
+    * **EV/EBITDA** -- point estimate with a +/-15% band.
+    * **P/FCF** -- point estimate with a +/-15% band.
+    * **Monte Carlo** -- 10th-to-90th percentile range.
+
+    A vertical dashed line marks the current market price.
+
+    If DCF or any multiples valuation returns zero, negative, ``NaN``,
+    or otherwise invalid values, that method is silently omitted and
+    the remaining methods are still rendered.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+
+    Returns
+    -------
+    plotly.graph_objects.Figure
+        Interactive horizontal bar chart.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
@@ -904,38 +1101,118 @@ def football_field(ticker, db_path=None):
     dcf_obj = DCFValuation(ticker, db)
     dcf_obj.compute_wacc()
     current_price = dcf_obj._get_current_price()
-    multiples = dcf_obj.multiples_valuation()
 
-    mc = monte_carlo(ticker, db, iterations=10_000)
+    # Attempt multiples valuation; tolerate failure.
+    multiples = None
+    try:
+        multiples = dcf_obj.multiples_valuation()
+    except Exception:
+        logger.warning(
+            "%s: multiples valuation failed; skipping multiples methods "
+            "in football field.",
+            ticker,
+            exc_info=True,
+        )
+
+    # Attempt Monte Carlo; tolerate failure.
+    mc = None
+    try:
+        mc = monte_carlo(ticker, db, iterations=10_000)
+    except Exception:
+        logger.warning(
+            "%s: Monte Carlo simulation failed; skipping Monte Carlo "
+            "range in football field.",
+            ticker,
+            exc_info=True,
+        )
 
     methods, low_vals, mid_vals, high_vals = [], [], [], []
 
-    # DCF (bear → bull)
-    if "bear" in scenarios_df.index and "bull" in scenarios_df.index:
-        methods.append("DCF")
-        low_vals.append(scenarios_df.at["bear", "implied_price"])
-        mid_vals.append(scenarios_df.at["base", "implied_price"])
-        high_vals.append(scenarios_df.at["bull", "implied_price"])
+    def _is_valid(value):
+        """Return True if *value* is a finite positive number."""
+        if value is None:
+            return False
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return False
+        return np.isfinite(v) and v > 0
 
-    # Multiples-based methods (±15 % band around point estimate)
+    # DCF (bear -> bull)
+    if "bear" in scenarios_df.index and "bull" in scenarios_df.index:
+        bear_price = scenarios_df.at["bear", "implied_price"]
+        base_price = scenarios_df.at["base", "implied_price"]
+        bull_price = scenarios_df.at["bull", "implied_price"]
+        if _is_valid(bear_price) and _is_valid(base_price) and _is_valid(bull_price):
+            methods.append("DCF")
+            low_vals.append(bear_price)
+            mid_vals.append(base_price)
+            high_vals.append(bull_price)
+        else:
+            logger.warning(
+                "%s: DCF scenario prices contain invalid values "
+                "(bear=%.2f, base=%.2f, bull=%.2f); skipping DCF in "
+                "football field.",
+                ticker,
+                float(bear_price) if bear_price is not None else 0.0,
+                float(base_price) if base_price is not None else 0.0,
+                float(bull_price) if bull_price is not None else 0.0,
+            )
+
+    # Multiples-based methods (+/-15% band around point estimate)
     for label, key in [
         ("Forward P/E", "forward_pe"),
         ("EV/EBITDA", "ev_ebitda"),
         ("P/FCF", "price_fcf"),
     ]:
         if multiples and key in multiples:
-            p = multiples[key]["implied_price"]
-            if p > 0:
+            p = multiples[key].get("implied_price", 0)
+            if _is_valid(p):
                 methods.append(label)
                 low_vals.append(p * 0.85)
                 mid_vals.append(p)
                 high_vals.append(p * 1.15)
+            else:
+                logger.info(
+                    "%s: %s implied price is invalid (%.4f); "
+                    "omitting from football field.",
+                    ticker,
+                    label,
+                    float(p) if p is not None else 0.0,
+                )
 
-    # Monte Carlo 10th–90th
-    methods.append("Monte Carlo\n(P10–P90)")
-    low_vals.append(mc["percentiles"]["p10"])
-    mid_vals.append(mc["percentiles"]["p50"])
-    high_vals.append(mc["percentiles"]["p90"])
+    # Monte Carlo 10th-90th
+    if mc is not None:
+        mc_p10 = mc["percentiles"]["p10"]
+        mc_p50 = mc["percentiles"]["p50"]
+        mc_p90 = mc["percentiles"]["p90"]
+        if _is_valid(mc_p10) and _is_valid(mc_p50) and _is_valid(mc_p90):
+            methods.append("Monte Carlo\n(P10–P90)")
+            low_vals.append(mc_p10)
+            mid_vals.append(mc_p50)
+            high_vals.append(mc_p90)
+        else:
+            logger.warning(
+                "%s: Monte Carlo percentiles contain invalid values; "
+                "skipping Monte Carlo in football field.",
+                ticker,
+            )
+
+    # If no methods produced valid ranges, return an informative empty chart.
+    if not methods:
+        logger.error(
+            "%s: no valuation methods produced valid ranges for the "
+            "football field chart.",
+            ticker,
+        )
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{ticker} — Football Field Valuation Summary "
+                  f"(no valid valuation data)",
+            template=TEMPLATE,
+            height=350,
+        )
+        return fig
 
     fig = go.Figure()
 
@@ -998,17 +1275,33 @@ def football_field(ticker, db_path=None):
 
 
 def generate_full_report(ticker, db_path=None):
-    """Run all charts and save as an HTML report.
+    """Run all charts and save them as a single interactive HTML report.
 
-    The report includes a summary section at the top (current price,
-    base-case fair value, upside/downside, key assumptions, WACC,
-    top sensitivities) followed by all eight interactive charts.
+    The report opens with a summary section (current price, base-case
+    fair value, upside/downside, key assumptions, WACC, top
+    sensitivities) followed by all eight interactive Plotly charts.
 
-    Returns the path to the saved HTML file.
+    Each sub-chart is generated inside its own ``try``/``except`` block
+    so that a failure in any single visualisation does not prevent the
+    remaining charts from being rendered.  Failures are logged at the
+    ``ERROR`` level.
+
+    Parameters
+    ----------
+    ticker : str
+        Equity ticker symbol (case-insensitive).
+    db_path : str or None
+        Path to the DuckDB database.
+
+    Returns
+    -------
+    str
+        Absolute path to the saved HTML file.
     """
     ticker = ticker.upper()
     db = _resolve_db(db_path)
 
+    logger.info("Generating full report for %s ...", ticker)
     print(f"Generating full report for {ticker}...")
 
     # ---- Compute model data for the summary section ----
@@ -1176,16 +1469,34 @@ def generate_full_report(ticker, db_path=None):
     chart_divs = []
     for i, (title, fn) in enumerate(chart_specs, 1):
         print(f"  Generating chart {i}/{len(chart_specs)}: {title}...")
-        fig = fn(ticker, db)
-        div_html = fig.to_html(full_html=False, include_plotlyjs=False)
-        chart_divs.append(
-            f'<div style="max-width:960px;margin:20px auto;padding:0 20px;">\n'
-            f'  <h2 style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
-            f"Roboto,sans-serif;color:#333;"
-            f'border-bottom:2px solid #e9ecef;padding-bottom:8px;">{title}</h2>\n'
-            f"  {div_html}\n"
-            f"</div>\n"
-        )
+        try:
+            fig = fn(ticker, db)
+            div_html = fig.to_html(full_html=False, include_plotlyjs=False)
+            chart_divs.append(
+                f'<div style="max-width:960px;margin:20px auto;padding:0 20px;">\n'
+                f'  <h2 style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+                f"Roboto,sans-serif;color:#333;"
+                f'border-bottom:2px solid #e9ecef;padding-bottom:8px;">{title}</h2>\n'
+                f"  {div_html}\n"
+                f"</div>\n"
+            )
+        except Exception:
+            logger.error(
+                "Chart '%s' for %s failed; skipping.",
+                title,
+                ticker,
+                exc_info=True,
+            )
+            chart_divs.append(
+                f'<div style="max-width:960px;margin:20px auto;padding:0 20px;">\n'
+                f'  <h2 style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\','
+                f"Roboto,sans-serif;color:#999;"
+                f'border-bottom:2px solid #e9ecef;padding-bottom:8px;">'
+                f"{title} (unavailable)</h2>\n"
+                f'  <p style="color:#999;">This chart could not be generated. '
+                f"Check the log for details.</p>\n"
+                f"</div>\n"
+            )
 
     full_html = (
         "<!DOCTYPE html>\n<html>\n<head>\n"
@@ -1209,6 +1520,7 @@ def generate_full_report(ticker, db_path=None):
         f.write(full_html)
 
     print(f"\nReport saved to: {output_path}")
+    logger.info("Report saved to: %s", output_path)
     return output_path
 
 
