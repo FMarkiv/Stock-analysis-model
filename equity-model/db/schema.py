@@ -1,39 +1,65 @@
 """
 Database schema definition and management for the equity model.
 
-Uses DuckDB with a single file at data/equity.duckdb.
-All financial data is stored in long/narrow format for flexibility.
+Uses DuckDB with a single file at ``data/equity.duckdb``.  All
+financial data is stored in long/narrow format for flexibility.
+
+Tables
+------
+company      -- one row per ticker with metadata and ingestion timestamp.
+financials   -- long-format financial data (income / balance / cashflow).
+segments     -- segment-level revenue and operating-income breakdown.
+assumptions  -- model assumptions keyed by (ticker, scenario, parameter).
+prices       -- daily OHLCV price data.
 """
 
+import logging
 import os
+
 import duckdb
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "equity.duckdb")
 
 
 def get_connection(db_path: str = DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
-    """Return a DuckDB connection, creating the data directory if needed."""
+    """Return a DuckDB connection, creating the data directory if needed.
+
+    Parameters
+    ----------
+    db_path : str
+        Path to the DuckDB database file.
+
+    Returns
+    -------
+    duckdb.DuckDBPyConnection
+    """
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     return duckdb.connect(db_path)
 
 
 def create_tables(con: duckdb.DuckDBPyConnection) -> None:
-    """Create all tables if they do not already exist."""
+    """Create all tables if they do not already exist.
+
+    Idempotent -- safe to call on every startup.
+    """
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS company (
-            ticker       VARCHAR NOT NULL PRIMARY KEY,
-            name         VARCHAR,
-            sector       VARCHAR,
-            currency     VARCHAR DEFAULT 'USD',
-            fiscal_year_end VARCHAR          -- e.g. 'December', 'June'
+            ticker          VARCHAR NOT NULL PRIMARY KEY,
+            name            VARCHAR,
+            sector          VARCHAR,
+            currency        VARCHAR DEFAULT 'USD',
+            fiscal_year_end VARCHAR,          -- e.g. 'December', 'June'
+            last_ingested   TIMESTAMP         -- when data was last pulled from APIs
         );
     """)
 
     # Long/narrow format: one row per (ticker, period, statement, line_item).
     # is_forecast + forecast_scenario distinguish actuals from projections.
     # forecast_scenario uses 'actual' (not NULL) so the UNIQUE constraint works
-    # — SQL treats NULLs as distinct, which would break duplicate detection.
+    # -- SQL treats NULLs as distinct, which would break duplicate detection.
     con.execute("""
         CREATE TABLE IF NOT EXISTS financials (
             ticker             VARCHAR NOT NULL,
@@ -91,15 +117,27 @@ def create_tables(con: duckdb.DuckDBPyConnection) -> None:
         );
     """)
 
+    # Migrate older schemas: add last_ingested column if it doesn't exist yet.
+    try:
+        con.execute(
+            "SELECT last_ingested FROM company LIMIT 0"
+        )
+    except duckdb.BinderException:
+        logger.info("Migrating company table: adding last_ingested column")
+        con.execute("ALTER TABLE company ADD COLUMN last_ingested TIMESTAMP")
+
 
 def drop_tables(con: duckdb.DuckDBPyConnection) -> None:
-    """Drop all project tables."""
+    """Drop all project tables (used for testing / full reset)."""
     for table in ("prices", "assumptions", "segments", "financials", "company"):
         con.execute(f"DROP TABLE IF EXISTS {table};")
 
 
 def reset_schema(db_path: str = DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
-    """Drop and recreate all tables. Returns the open connection."""
+    """Drop and recreate all tables.
+
+    Returns the open connection.
+    """
     con = get_connection(db_path)
     drop_tables(con)
     create_tables(con)
@@ -107,7 +145,10 @@ def reset_schema(db_path: str = DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
 
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> duckdb.DuckDBPyConnection:
-    """Initialise the database (create tables if missing). Returns the open connection."""
+    """Initialise the database (create tables if missing).
+
+    Returns the open connection.
+    """
     con = get_connection(db_path)
     create_tables(con)
     return con

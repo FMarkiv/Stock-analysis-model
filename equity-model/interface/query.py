@@ -138,11 +138,16 @@ def _fmt_number(val, pct: bool = False) -> str:
 
 
 def _print_valuation_summary(ticker: str, base_dcf: dict, dcf: DCFValuation) -> None:
-    """Print a concise valuation summary panel."""
+    """Print a concise valuation summary panel.
+
+    Handles the case where DCF is invalid (negative earnings) by showing
+    a warning and falling back to multiples-based valuation if available.
+    """
     current = base_dcf.get("current_price", 0)
     implied = base_dcf.get("implied_price", 0)
     upside = base_dcf.get("upside_downside", 0)
     wacc = dcf._wacc_result.get("wacc", 0) if dcf._wacc_result else 0
+    dcf_valid = base_dcf.get("dcf_valid", True)
 
     color = "green" if upside > 0 else "red"
 
@@ -150,12 +155,40 @@ def _print_valuation_summary(ticker: str, base_dcf: dict, dcf: DCFValuation) -> 
     table.add_column(style="bold")
     table.add_column(justify="right")
     table.add_row("Current Price", f"${current:,.2f}")
-    table.add_row("Fair Value (Base)", f"${implied:,.2f}")
-    table.add_row("Upside/Downside", f"[{color}]{upside:+.1%}[/]")
+
+    if dcf_valid and implied > 0:
+        table.add_row("Fair Value (Base DCF)", f"${implied:,.2f}")
+        table.add_row("Upside/Downside", f"[{color}]{upside:+.1%}[/]")
+    else:
+        table.add_row("Fair Value (Base DCF)", "[yellow]N/A (see warning)[/]")
+
     table.add_row("WACC", f"{wacc:.2%}")
 
-    console.print(Panel(table, title=f"[bold]{ticker} Valuation Summary[/]",
-                        border_style="blue"))
+    # Show multiples-based valuation as fallback/supplement
+    try:
+        multiples = dcf.multiples_valuation()
+        if multiples:
+            for method_key, label in [("forward_pe", "P/E"), ("ev_ebitda", "EV/EBITDA")]:
+                m = multiples.get(method_key, {})
+                if m and not m.get("skipped") and m.get("implied_price", 0) > 0:
+                    table.add_row(
+                        f"Fair Value ({label})",
+                        f"${m['implied_price']:,.2f}",
+                    )
+    except Exception:
+        pass
+
+    panel = Panel(
+        table,
+        title=f"[bold]{ticker} Valuation Summary[/]",
+        border_style="blue",
+    )
+    console.print(panel)
+
+    # Show DCF warning if applicable
+    dcf_warning = base_dcf.get("dcf_warning")
+    if dcf_warning:
+        console.print(f"  [yellow]DCF Warning:[/] {dcf_warning}")
 
 
 def _display_dataframe(df: pd.DataFrame, title: str = "") -> None:

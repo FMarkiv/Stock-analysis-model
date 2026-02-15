@@ -1,8 +1,24 @@
 """
-Mappings between external data source field names and internal line-item names.
+Mappings between external data-source field names and internal line-item names.
+
+Each dictionary maps one or more external field names (from yfinance or
+SEC EDGAR XBRL) to a single canonical internal name used in the
+``financials`` table.  When multiple external names map to the same
+internal name (aliases), the ingestion layer accepts whichever one appears
+first in the source DataFrame.
+
+Dictionaries
+------------
+YFINANCE_INCOME_MAP   -- yfinance income-statement fields
+YFINANCE_BALANCE_MAP  -- yfinance balance-sheet fields
+YFINANCE_CASHFLOW_MAP -- yfinance cash-flow statement fields
+XBRL_TO_LINE_ITEM     -- SEC EDGAR XBRL us-gaap concept names
 """
 
+# ---------------------------------------------------------------------------
 # SEC EDGAR XBRL tags -> internal line-item names
+# ---------------------------------------------------------------------------
+
 XBRL_TO_LINE_ITEM: dict[str, str] = {
     "Revenues": "revenue",
     "CostOfGoodsAndServicesSold": "cost_of_revenue",
@@ -19,13 +35,17 @@ STATEMENT_MAP: dict[str, str] = {
 
 # ---------------------------------------------------------------------------
 # yfinance field name -> standardised line-item name
+#
 # Organised by financial statement type.
-# Multiple yfinance names may map to the same internal name (aliases).
+# Multiple yfinance names may map to the same internal name (aliases)
+# because yfinance uses different column names across companies and
+# API versions.
 # ---------------------------------------------------------------------------
 
 YFINANCE_INCOME_MAP: dict[str, str] = {
     # Revenue & costs
     "Total Revenue": "total_revenue",
+    "Operating Revenue": "total_revenue",          # some companies use this instead
     "Cost Of Revenue": "cost_of_revenue",
     "Gross Profit": "gross_profit",
     # Operating expenses

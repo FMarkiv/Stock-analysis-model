@@ -1,13 +1,30 @@
 """
 Scenario management: run bull / base / bear DCF valuations and
 Monte Carlo simulation.
+
+This module provides two primary entry points:
+
+* :func:`run_scenarios` — deterministic bull / base / bear analysis
+  that shifts key assumptions by fixed amounts and returns a
+  comparison table of implied equity prices.
+
+* :func:`monte_carlo` — stochastic simulation that samples assumptions
+  from statistical distributions centred on the base case and produces
+  a probability-weighted range of fair-value estimates.
+
+Both functions persist their intermediate results (assumptions,
+forecasts) to the project DuckDB so downstream notebooks / dashboards
+can query them directly.
 """
 
+import logging
 import os
 import sys
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -17,6 +34,29 @@ from db.schema import get_connection  # noqa: E402
 from model.dcf import DCFValuation, _load_config  # noqa: E402
 from model.statements import FinancialModel, _sort_periods, _fy_year  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Scenario offset constants
+# ---------------------------------------------------------------------------
+# These constants define how much each scenario shifts the base-case
+# assumptions.  They are expressed in *percentage-point* terms (i.e. 0.02
+# means "+2 pp").  Changing them here will affect every call to
+# ``run_scenarios``.
+
+# Bull scenario: optimistic revenue growth, higher margins, lower WACC
+BULL_REVENUE_GROWTH_OFFSET = 0.02      # +2 pp revenue growth
+BULL_OPERATING_MARGIN_OFFSET = 0.01    # +1 pp operating margin
+BULL_WACC_OFFSET = -0.01              # -1 pp WACC (lower discount rate)
+
+# Base scenario: no adjustments (use auto-generated assumptions as-is)
+BASE_REVENUE_GROWTH_OFFSET = 0.0
+BASE_OPERATING_MARGIN_OFFSET = 0.0
+BASE_WACC_OFFSET = 0.0
+
+# Bear scenario: lower growth, compressed margins, higher WACC
+BEAR_REVENUE_GROWTH_OFFSET = -0.03    # -3 pp revenue growth
+BEAR_OPERATING_MARGIN_OFFSET = -0.015  # -1.5 pp operating margin
+BEAR_WACC_OFFSET = 0.015             # +1.5 pp WACC (higher discount rate)
+
 
 # ---------------------------------------------------------------------------
 # 1. run_scenarios
@@ -24,32 +64,52 @@ from model.statements import FinancialModel, _sort_periods, _fy_year  # noqa: E4
 
 
 def run_scenarios(ticker: str, db_path: str | None = None) -> pd.DataFrame:
-    """Run bull, base, and bear DCF valuations.
+    """Run bull, base, and bear DCF valuations and return a comparison table.
+
+    For each of the three scenarios the function:
+
+    1. Adjusts the base-case assumptions by the predefined offsets
+       (see module-level constants ``BULL_*``, ``BASE_*``, ``BEAR_*``).
+    2. Writes the adjusted assumptions to the database and generates a
+       new forecast.
+    3. Runs (or re-discounts) a DCF valuation with the scenario's WACC.
+    4. Collects the implied share price and upside/downside into a row.
 
     **Scenario definitions (relative to auto-generated base):**
 
-    * **Bull** — revenue growth +2 pp, operating margin +1 pp,
+    * **Bull** -- revenue growth +2 pp, operating margin +1 pp,
       WACC -1 pp.
-    * **Base** — auto-generated assumptions (from FinancialModel).
-    * **Bear** — revenue growth -3 pp, operating margin -1.5 pp,
+    * **Base** -- auto-generated assumptions (from FinancialModel).
+    * **Bear** -- revenue growth -3 pp, operating margin -1.5 pp,
       WACC +1.5 pp.
 
     Each scenario's assumptions and forecasts are stored in the
     ``assumptions`` and ``financials`` tables so they can be queried
     later.
 
+    Error handling
+    ~~~~~~~~~~~~~~
+    Each scenario is wrapped in its own ``try / except``.  If bull or
+    bear fails (e.g. negative earnings break the DCF), a warning is
+    logged and the remaining scenarios still execute.  When
+    ``dcf_valuation`` returns ``dcf_valid == False`` (e.g. all projected
+    FCFs are negative), the row is still included but the
+    ``dcf_valid`` column is set to ``False`` so callers can filter or
+    flag it.
+
     Parameters
     ----------
     ticker : str
         Stock ticker symbol.
     db_path : str, optional
-        Path to DuckDB file.
+        Path to DuckDB file.  Defaults to ``<project>/data/equity.duckdb``.
 
     Returns
     -------
     pd.DataFrame
         Columns: ``scenario``, ``implied_price``, ``upside_downside``,
-        ``revenue_growth``, ``operating_margin``, ``wacc``.
+        ``revenue_growth``, ``operating_margin``, ``wacc``,
+        ``dcf_valid``.
     """
     ticker = ticker.upper()
     db = db_path or os.path.join(_PROJECT_ROOT, "data", "equity.duckdb")
@@ -65,70 +125,91 @@ def run_scenarios(ticker: str, db_path: str | None = None) -> pd.DataFrame:
     base_rev_growth = base_assumptions.get("revenue_growth", 0.05)
     base_op_margin = base_assumptions.get("operating_margin", 0.20)
 
-    # --- Define scenario adjustments ---
+    # --- Define scenario adjustments using named constants ---
     adjustments = {
         "bull": {
-            "revenue_growth": base_rev_growth + 0.02,
-            "operating_margin": base_op_margin + 0.01,
-            "wacc_delta": -0.01,
+            "revenue_growth": base_rev_growth + BULL_REVENUE_GROWTH_OFFSET,
+            "operating_margin": base_op_margin + BULL_OPERATING_MARGIN_OFFSET,
+            "wacc_delta": BULL_WACC_OFFSET,
         },
         "base": {
-            "revenue_growth": base_rev_growth,
-            "operating_margin": base_op_margin,
-            "wacc_delta": 0.0,
+            "revenue_growth": base_rev_growth + BASE_REVENUE_GROWTH_OFFSET,
+            "operating_margin": base_op_margin + BASE_OPERATING_MARGIN_OFFSET,
+            "wacc_delta": BASE_WACC_OFFSET,
         },
         "bear": {
-            "revenue_growth": base_rev_growth - 0.03,
-            "operating_margin": base_op_margin - 0.015,
-            "wacc_delta": 0.015,
+            "revenue_growth": base_rev_growth + BEAR_REVENUE_GROWTH_OFFSET,
+            "operating_margin": base_op_margin + BEAR_OPERATING_MARGIN_OFFSET,
+            "wacc_delta": BEAR_WACC_OFFSET,
         },
     }
 
     rows: list[dict] = []
 
     for scenario_name, adj in adjustments.items():
-        # Write scenario assumptions to DB
-        if scenario_name != "base":
-            # Copy all base assumptions, then override
-            scenario_assumptions = dict(base_assumptions)
-            scenario_assumptions["revenue_growth"] = adj["revenue_growth"]
-            scenario_assumptions["operating_margin"] = adj["operating_margin"]
-            model._save_assumptions(scenario_name, scenario_assumptions)
+        try:
+            # Write scenario assumptions to DB
+            if scenario_name != "base":
+                # Copy all base assumptions, then override
+                scenario_assumptions = dict(base_assumptions)
+                scenario_assumptions["revenue_growth"] = adj["revenue_growth"]
+                scenario_assumptions["operating_margin"] = adj["operating_margin"]
+                model._save_assumptions(scenario_name, scenario_assumptions)
 
-            # Generate forecast with these assumptions
-            dcf._forecasts[scenario_name] = model.forecast(
-                years=5, scenario=scenario_name,
+                # Generate forecast with these assumptions
+                dcf._forecasts[scenario_name] = model.forecast(
+                    years=5, scenario=scenario_name,
+                )
+
+            # Run DCF with possibly adjusted WACC
+            base_dcf_result = dcf.dcf_valuation(scenario=scenario_name)
+
+            # Check whether the DCF result is flagged as invalid
+            dcf_valid = base_dcf_result.get("dcf_valid", True)
+            if not dcf_valid:
+                logger.warning(
+                    "%s scenario for %s: DCF flagged as invalid (%s). "
+                    "Row included but marked dcf_valid=False.",
+                    scenario_name,
+                    ticker,
+                    base_dcf_result.get("dcf_warning", "unknown reason"),
+                )
+
+            # If WACC adjustment, re-discount with shifted WACC
+            if adj["wacc_delta"] != 0:
+                adjusted_wacc = base_wacc + adj["wacc_delta"]
+                implied_price = dcf._quick_dcf(
+                    base_dcf=base_dcf_result,
+                    wacc=adjusted_wacc,
+                )
+                current_price = base_dcf_result["current_price"]
+                upside = (
+                    (implied_price / current_price - 1)
+                    if current_price > 0
+                    else 0.0
+                )
+            else:
+                implied_price = base_dcf_result["implied_price"]
+                upside = base_dcf_result["upside_downside"]
+                adjusted_wacc = base_wacc
+
+            rows.append({
+                "scenario": scenario_name,
+                "implied_price": round(implied_price, 2),
+                "upside_downside": round(upside, 4),
+                "revenue_growth": round(adj["revenue_growth"], 4),
+                "operating_margin": round(adj["operating_margin"], 4),
+                "wacc": round(adjusted_wacc, 4),
+                "dcf_valid": dcf_valid,
+            })
+
+        except Exception:
+            logger.warning(
+                "Scenario '%s' for %s failed; skipping.",
+                scenario_name,
+                ticker,
+                exc_info=True,
             )
-
-        # Run DCF with possibly adjusted WACC
-        base_dcf_result = dcf.dcf_valuation(scenario=scenario_name)
-
-        # If WACC adjustment, re-discount with shifted WACC
-        if adj["wacc_delta"] != 0:
-            adjusted_wacc = base_wacc + adj["wacc_delta"]
-            implied_price = dcf._quick_dcf(
-                base_dcf=base_dcf_result,
-                wacc=adjusted_wacc,
-            )
-            current_price = base_dcf_result["current_price"]
-            upside = (
-                (implied_price / current_price - 1)
-                if current_price > 0
-                else 0.0
-            )
-        else:
-            implied_price = base_dcf_result["implied_price"]
-            upside = base_dcf_result["upside_downside"]
-            adjusted_wacc = base_wacc
-
-        rows.append({
-            "scenario": scenario_name,
-            "implied_price": round(implied_price, 2),
-            "upside_downside": round(upside, 4),
-            "revenue_growth": round(adj["revenue_growth"], 4),
-            "operating_margin": round(adj["operating_margin"], 4),
-            "wacc": round(adjusted_wacc, 4),
-        })
 
     return pd.DataFrame(rows).set_index("scenario")
 
@@ -146,32 +227,49 @@ def monte_carlo(
     """Monte Carlo simulation of fair value.
 
     Samples key assumptions from statistical distributions centred on
-    the base case and runs a lightweight DCF for each draw.
+    the base case and runs a lightweight DCF for each draw, producing a
+    probability-weighted distribution of implied share prices.
 
     **Distributions used:**
 
-    * Revenue growth — Normal(base, 2 pp std).
-    * Operating margin — Triangular(base - 3 pp, base, base + 2 pp).
-    * Terminal growth — Normal(base, 0.5 pp std), clipped to [0 %, 4 %].
-    * WACC — Normal(base, 1 pp std), clipped to [4 %, 20 %].
+    * Revenue growth -- Normal(base, 2 pp std).
+    * Operating margin -- Triangular(base - 3 pp, base, base + 2 pp).
+    * Terminal growth -- Normal(base, 0.5 pp std), clipped to [0 %, 4 %].
+    * WACC -- Normal(base, 1 pp std), clipped to [4 %, 20 %].
+
+    Negative / zero prices
+    ~~~~~~~~~~~~~~~~~~~~~~
+    Some iterations may produce negative or zero implied prices (e.g.
+    when a loss-making company's projected FCFs are deeply negative).
+    These iterations are **excluded** from the summary statistics
+    (mean, std, percentiles) but are still present in the raw
+    ``all_values`` array.  The return dict includes
+    ``negative_iterations`` reporting how many draws produced a
+    non-positive price.
 
     Parameters
     ----------
     ticker : str
-        Stock ticker.
+        Stock ticker symbol.
     db_path : str, optional
-        DuckDB path.
+        DuckDB path.  Defaults to ``<project>/data/equity.duckdb``.
     iterations : int
         Number of simulation runs (default 10 000).
 
     Returns
     -------
     dict
-        ``percentiles`` — dict mapping percentile labels to fair-value
+        ``percentiles`` -- dict mapping percentile labels to fair-value
         estimates (10th, 25th, 50th, 75th, 90th).
-        ``all_values`` — numpy array of all simulated fair values
-        (suitable for histogram plotting).
-        ``mean``, ``std`` — summary statistics.
+        ``all_values`` -- numpy array of *all* simulated fair values
+        (including negatives; suitable for histogram plotting).
+        ``positive_values`` -- numpy array containing only the
+        strictly-positive simulated fair values used for statistics.
+        ``mean``, ``std`` -- summary statistics (computed on positive
+        values only).
+        ``iterations`` -- total number of iterations requested.
+        ``negative_iterations`` -- count of iterations that produced a
+        zero or negative implied price.
     """
     ticker = ticker.upper()
     db = db_path or os.path.join(_PROJECT_ROOT, "data", "equity.duckdb")
@@ -274,19 +372,50 @@ def monte_carlo(
         equity = ev - net_debt
         fair_values[i] = equity / shares if shares > 0 else 0.0
 
-    # --- Compute percentiles ---
-    pcts = {
-        "p10": float(np.percentile(fair_values, 10)),
-        "p25": float(np.percentile(fair_values, 25)),
-        "p50": float(np.percentile(fair_values, 50)),
-        "p75": float(np.percentile(fair_values, 75)),
-        "p90": float(np.percentile(fair_values, 90)),
-    }
+    # --- Filter out negative / zero prices for statistics ---
+    positive_mask = fair_values > 0
+    positive_values = fair_values[positive_mask]
+    negative_count = int(np.sum(~positive_mask))
+
+    if negative_count > 0:
+        logger.warning(
+            "Monte Carlo for %s: %d of %d iterations (%.1f%%) produced "
+            "zero or negative implied prices; these are excluded from "
+            "summary statistics.",
+            ticker,
+            negative_count,
+            iterations,
+            100.0 * negative_count / iterations,
+        )
+
+    # --- Compute percentiles on positive values only ---
+    if len(positive_values) > 0:
+        pcts = {
+            "p10": float(np.percentile(positive_values, 10)),
+            "p25": float(np.percentile(positive_values, 25)),
+            "p50": float(np.percentile(positive_values, 50)),
+            "p75": float(np.percentile(positive_values, 75)),
+            "p90": float(np.percentile(positive_values, 90)),
+        }
+        mean_val = float(np.mean(positive_values))
+        std_val = float(np.std(positive_values))
+    else:
+        logger.warning(
+            "Monte Carlo for %s: all %d iterations produced zero or "
+            "negative prices. Statistics will be zero.",
+            ticker,
+            iterations,
+        )
+        pcts = {"p10": 0.0, "p25": 0.0, "p50": 0.0, "p75": 0.0, "p90": 0.0}
+        mean_val = 0.0
+        std_val = 0.0
 
     return {
         "percentiles": pcts,
-        "mean": float(np.mean(fair_values)),
-        "std": float(np.std(fair_values)),
+        "mean": mean_val,
+        "std": std_val,
         "all_values": fair_values,
+        "positive_values": positive_values,
         "iterations": iterations,
+        "negative_iterations": negative_count,
     }

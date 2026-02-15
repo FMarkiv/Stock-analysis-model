@@ -1,12 +1,16 @@
 """
 Data ingestion from external sources (Yahoo Finance, SEC EDGAR).
 
+Pulls price, financial-statement, and segment data into DuckDB.
+Designed to be resilient: if any single data source fails the
+pipeline logs a warning and continues with whatever is available.
+
 Functions
 ---------
-ingest_price_data              – daily OHLCV from yfinance  -> prices table
-ingest_financials_from_yfinance – quarterly & annual statements -> financials table
-ingest_segments_edgar          – segment revenue from SEC EDGAR XBRL / config fallback -> segments table
-ingest_all                     – master driver that runs everything and prints a summary
+ingest_price_data              -- daily OHLCV from yfinance  -> prices table
+ingest_financials_from_yfinance -- quarterly & annual statements -> financials table
+ingest_segments_edgar          -- segment revenue from SEC EDGAR XBRL / config fallback -> segments table
+ingest_all                     -- master driver that runs everything and prints a summary
 """
 
 import logging
@@ -19,7 +23,7 @@ import requests
 import yaml
 import yfinance as yf
 
-# Allow running as `python data/ingest.py` from the equity-model directory.
+# Allow running as ``python data/ingest.py`` from the equity-model directory.
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
@@ -41,8 +45,8 @@ logger = logging.getLogger(__name__)
 def _date_to_period(dt: pd.Timestamp, period_type: str) -> str:
     """Convert a pandas Timestamp to a period string.
 
-    Annual  -> 'FY2023'
-    Quarterly -> 'Q3 2023'  (calendar quarter based on period-end month)
+    Annual  -> ``'FY2023'``
+    Quarterly -> ``'Q3 2023'``  (calendar quarter based on period-end month)
     """
     if period_type == "annual":
         return f"FY{dt.year}"
@@ -63,12 +67,23 @@ def _strip_tz(series: pd.Series) -> pd.Series:
 
 
 def ingest_price_data(ticker: str, years: int = 10) -> dict:
-    """Pull daily price/volume data from yfinance and upsert into the prices table.
+    """Pull daily price/volume data from yfinance and upsert into the
+    ``prices`` table.
 
     Uses a delete-then-insert strategy for the given ticker which is
     equivalent to a full upsert and much faster than row-by-row.
 
-    Returns a summary dict with row count and date range.
+    Parameters
+    ----------
+    ticker : str
+        Stock ticker symbol.
+    years : int
+        Number of years of history to fetch (default 10).
+
+    Returns
+    -------
+    dict
+        ``{'ticker', 'rows', 'start', 'end'}``
     """
     logger.info("Fetching price data for %s (%d years)", ticker, years)
 
@@ -128,9 +143,12 @@ def _ingest_statement(
     period_type: str,
     mapping: dict[str, str],
 ) -> dict:
-    """Ingest one financial-statement DataFrame into the *financials* table.
+    """Ingest one financial-statement DataFrame into the ``financials`` table.
 
-    Returns ``{"loaded": int, "skipped": list[str], "periods": set[str]}``.
+    Handles missing line items gracefully -- items that are absent from the
+    source DataFrame are simply skipped and logged as warnings.
+
+    Returns ``{'loaded': int, 'skipped': list[str], 'periods': set[str]}``.
     """
     loaded = 0
     skipped: list[str] = []
@@ -191,8 +209,13 @@ def _ingest_statement(
 
 
 def ingest_financials_from_yfinance(ticker: str) -> dict:
-    """Pull quarterly and annual income-statement, balance-sheet, and cash-flow
-    data from yfinance, map to standardised names, and upsert into *financials*.
+    """Pull quarterly and annual income-statement, balance-sheet, and
+    cash-flow data from yfinance, map to standardised names, and upsert
+    into the ``financials`` table.
+
+    Each statement type is wrapped in its own try/except so that a failure
+    in one (e.g. missing quarterly data for some companies) does not block
+    the rest.
 
     Returns a summary dict.
     """
@@ -228,8 +251,8 @@ def ingest_financials_from_yfinance(ticker: str) -> dict:
                         all_skipped.append(s)
                 all_periods.update(result["periods"])
             except Exception as e:
-                logger.error(
-                    "Error ingesting %s %s for %s: %s",
+                logger.warning(
+                    "Error ingesting %s %s for %s: %s (continuing with other statements)",
                     period_type, statement, ticker, e,
                 )
     finally:
@@ -250,14 +273,14 @@ def ingest_financials_from_yfinance(ticker: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# 3. Segments – SEC EDGAR XBRL with config-based fallback
+# 3. Segments -- SEC EDGAR XBRL with config-based fallback
 # ---------------------------------------------------------------------------
 
 _CONFIG_PATH = os.path.join(_PROJECT_ROOT, "config.yaml")
 
 
 def _load_config() -> dict:
-    """Load and return the project config.yaml as a dict."""
+    """Load and return the project ``config.yaml`` as a dict."""
     try:
         with open(_CONFIG_PATH) as f:
             return yaml.safe_load(f) or {}
@@ -269,7 +292,8 @@ def _load_config() -> dict:
 def _resolve_cik(ticker: str, user_agent: str) -> str | None:
     """Resolve a stock ticker to a zero-padded SEC CIK string.
 
-    Uses the SEC company tickers JSON endpoint.
+    Uses the SEC company tickers JSON endpoint.  Returns ``None`` on
+    any network failure or if the ticker is not found.
     """
     url = "https://www.sec.gov/files/company_tickers.json"
     headers = {"User-Agent": user_agent}
@@ -295,9 +319,12 @@ def _fetch_edgar_segments(
 ) -> list[dict] | None:
     """Fetch segment revenue data from SEC EDGAR XBRL company facts.
 
-    Looks for revenue concepts that carry a segment dimension.
-    Returns a list of dicts ``{period, segment_name, revenue}`` or *None*
-    if segment data cannot be extracted.
+    Looks for revenue concepts that carry a segment dimension
+    (``srt:ProductOrServiceAxis``, ``us-gaap:StatementBusinessSegmentsAxis``,
+    or ``srt:ConsolidationItemsAxis``).
+
+    Returns a list of dicts ``{period, segment_name, revenue}`` or
+    ``None`` if segment data cannot be extracted.
     """
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
     headers = {"User-Agent": user_agent}
@@ -330,8 +357,8 @@ def _fetch_edgar_segments(
         usd_facts = units.get("USD", [])
 
         for fact in usd_facts:
-            # Segment-dimensioned facts include a "dimensions" or "segment"
-            # key that distinguishes them from the consolidated total.
+            # Segment-dimensioned facts include a "dimensions" key that
+            # distinguishes them from the consolidated total.
             dim = fact.get("dimensions", {})
             seg_member = dim.get(
                 "srt:ProductOrServiceAxis",
@@ -383,10 +410,11 @@ def _fetch_edgar_segments(
 def _apply_segment_overrides(
     ticker: str, con, config: dict,
 ) -> int:
-    """Apply manual segment percentage overrides from config.yaml.
+    """Apply manual segment percentage overrides from ``config.yaml``.
 
-    Reads total_revenue from the financials table for each annual period
-    and splits it according to the configured percentages.
+    Reads ``total_revenue`` from the ``financials`` table for each annual
+    period and splits it according to the configured percentages.
+
     Returns the number of segment rows inserted.
     """
     overrides = config.get("segment_overrides", {}).get(ticker.upper())
@@ -433,14 +461,16 @@ def _apply_segment_overrides(
 
 
 def ingest_segments_edgar(ticker: str) -> dict:
-    """Ingest segment-level revenue data into the segments table.
+    """Ingest segment-level revenue data into the ``segments`` table.
 
-    Strategy (in order):
-    1. Fetch segment data from SEC EDGAR XBRL company facts API.
-    2. If EDGAR data is unavailable, fall back to manual percentage
-       overrides defined in config.yaml ``segment_overrides``.
-    3. If neither source provides data, store total revenue as a
-       single 'Total' segment (original fallback behaviour).
+    Three-tier fallback strategy:
+
+    1. **SEC EDGAR XBRL** -- fetch segment-dimensioned revenue from the
+       company facts API.
+    2. **Config overrides** -- manual percentage splits defined in
+       ``config.yaml`` under ``segment_overrides``.
+    3. **Total fallback** -- store total revenue as a single ``'Total'``
+       segment so downstream code always has something to work with.
     """
     logger.info("Fetching segment data for %s", ticker)
     config = _load_config()
@@ -490,30 +520,37 @@ def ingest_segments_edgar(ticker: str) -> dict:
                 t = yf.Ticker(ticker)
                 income = getattr(t, "income_stmt", None)
                 if income is not None and not income.empty:
-                    for date_col in income.columns:
-                        period = _date_to_period(date_col, "annual")
-                        if "Total Revenue" not in income.index:
-                            logger.warning(
-                                "Total Revenue not in income statement for %s",
-                                ticker,
-                            )
+                    # Try multiple yfinance revenue field names for robustness
+                    revenue_row_name = None
+                    for candidate in ("Total Revenue", "Operating Revenue", "Revenue"):
+                        if candidate in income.index:
+                            revenue_row_name = candidate
                             break
-                        revenue = income.loc["Total Revenue", date_col]
-                        if pd.isna(revenue):
-                            continue
-                        con.execute(
-                            """
-                            INSERT INTO segments
-                                (ticker, period, segment_name, revenue,
-                                 is_forecast, forecast_scenario)
-                            VALUES (?, ?, 'Total', ?, false, 'actual')
-                            ON CONFLICT (ticker, period, segment_name,
-                                         is_forecast, forecast_scenario)
-                            DO UPDATE SET revenue = EXCLUDED.revenue
-                            """,
-                            [ticker, period, float(revenue)],
+
+                    if revenue_row_name is None:
+                        logger.warning(
+                            "No recognisable revenue row in income statement for %s",
+                            ticker,
                         )
-                        loaded += 1
+                    else:
+                        for date_col in income.columns:
+                            period = _date_to_period(date_col, "annual")
+                            revenue = income.loc[revenue_row_name, date_col]
+                            if pd.isna(revenue):
+                                continue
+                            con.execute(
+                                """
+                                INSERT INTO segments
+                                    (ticker, period, segment_name, revenue,
+                                     is_forecast, forecast_scenario)
+                                VALUES (?, ?, 'Total', ?, false, 'actual')
+                                ON CONFLICT (ticker, period, segment_name,
+                                             is_forecast, forecast_scenario)
+                                DO UPDATE SET revenue = EXCLUDED.revenue
+                                """,
+                                [ticker, period, float(revenue)],
+                            )
+                            loaded += 1
 
         logger.info(
             "Segment ingestion for %s complete: %d entries (source: %s)",
@@ -534,7 +571,12 @@ def ingest_segments_edgar(ticker: str) -> dict:
 
 
 def ingest_all(ticker: str) -> None:
-    """Run all ingestion steps for *ticker* and print a human-readable summary."""
+    """Run all ingestion steps for *ticker* and print a human-readable summary.
+
+    Each step is wrapped in its own try/except so that a failure in one
+    data source does not prevent the others from running.  After all steps
+    complete, the ``company.last_ingested`` timestamp is updated.
+    """
     print(f"\n{'=' * 60}")
     print(f"  Ingesting data for {ticker}")
     print(f"{'=' * 60}\n")
@@ -547,18 +589,20 @@ def ingest_all(ticker: str) -> None:
         try:
             con.execute(
                 """
-                INSERT INTO company (ticker, name, sector, fiscal_year_end)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO company (ticker, name, sector, fiscal_year_end, last_ingested)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT (ticker) DO UPDATE SET
                     name = EXCLUDED.name,
                     sector = EXCLUDED.sector,
-                    fiscal_year_end = EXCLUDED.fiscal_year_end
+                    fiscal_year_end = EXCLUDED.fiscal_year_end,
+                    last_ingested = EXCLUDED.last_ingested
                 """,
                 [
                     ticker,
                     info.get("shortName", ticker),
                     info.get("sector"),
                     info.get("fiscalYearEnd"),
+                    datetime.now(),
                 ],
             )
         finally:
@@ -578,7 +622,7 @@ def ingest_all(ticker: str) -> None:
         else:
             print("   No price data available")
     except Exception as e:
-        print(f"   Price data failed: {e}")
+        print(f"   [WARNING] Price data failed: {e}")
         logger.exception("Price ingestion failed for %s", ticker)
         price_result = {"rows": 0}
 
@@ -593,7 +637,7 @@ def ingest_all(ticker: str) -> None:
         if fin_result["missing_items"]:
             print(f"   Missing items: {', '.join(fin_result['missing_items'])}")
     except Exception as e:
-        print(f"   Financial data failed: {e}")
+        print(f"   [WARNING] Financial data failed: {e}")
         logger.exception("Financial ingestion failed for %s", ticker)
         fin_result = {"total_items_loaded": 0, "periods": 0, "missing_items": []}
 
@@ -607,9 +651,22 @@ def ingest_all(ticker: str) -> None:
             f"(source: {source})"
         )
     except Exception as e:
-        print(f"   Segment data failed: {e}")
+        print(f"   [WARNING] Segment data failed: {e}")
         logger.exception("Segment ingestion failed for %s", ticker)
         seg_result = {"segments_loaded": 0}
+
+    # --- Update last_ingested timestamp -----------------------------------
+    try:
+        con = init_db()
+        try:
+            con.execute(
+                "UPDATE company SET last_ingested = ? WHERE ticker = ?",
+                [datetime.now(), ticker],
+            )
+        finally:
+            con.close()
+    except Exception:
+        pass  # non-critical
 
     # --- Summary ----------------------------------------------------------
     print(f"\n{'=' * 60}")

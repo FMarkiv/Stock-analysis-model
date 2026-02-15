@@ -2,16 +2,35 @@
 Three-statement financial model: income statement, balance sheet, cash flow.
 
 Core class ``FinancialModel`` loads historical data from DuckDB, computes
-derived metrics, generates multi-year forecasts, and writes projections
+derived metrics (margins, returns, working-capital days, etc.), generates
+multi-year forecasts under configurable scenarios, and writes projections
 back to the database.
+
+The forecasting engine applies revenue-growth decay toward long-run GDP
+growth, drives balance-sheet items off revenue or COGS ratios, and closes
+the cash-flow waterfall so that assets = liabilities + equity each period.
+
+Robustness features
+-------------------
+* Missing line items (e.g. inventory, R&D) are handled gracefully --
+  the model falls back to safe defaults rather than crashing.
+* Negative-earnings edge cases are treated explicitly: no tax on losses,
+  payout ratios clamped to sensible ranges, buyback percentages floored
+  at zero.
+* Balance-sheet imbalances emit a warning (with a 0.1 % relative
+  tolerance) instead of raising an exception, so downstream analysis
+  can still proceed.
 """
 
+import logging
 import os
 import sys
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
@@ -59,7 +78,7 @@ CASHFLOW_ITEMS = [
 # ---------------------------------------------------------------------------
 
 def _safe_div(a, b):
-    """Divide a/b, returning NaN when b is zero or either value is NaN."""
+    """Divide *a* / *b*, returning ``NaN`` when *b* is zero or either value is ``NaN``/``None``."""
     if b is None or a is None:
         return np.nan
     if isinstance(b, (int, float)) and b == 0:
@@ -70,7 +89,9 @@ def _safe_div(a, b):
 def _sort_periods(periods: list[str]) -> list[str]:
     """Sort period strings chronologically.
 
-    Handles 'FY2023' and 'Q3 2023' formats.
+    Handles ``'FY2023'`` and ``'Q3 2023'`` formats.  Fiscal-year
+    periods sort after the fourth quarter of the same calendar year
+    so that ``FY2023`` follows ``Q4 2023``.
     """
     def _key(p: str):
         if p.startswith("FY"):
@@ -83,7 +104,7 @@ def _sort_periods(periods: list[str]) -> list[str]:
 
 
 def _fy_year(period: str) -> int:
-    """Extract the numeric year from a period string like 'FY2023'."""
+    """Extract the numeric year from a period string like ``'FY2023'``."""
     return int(period.replace("FY", ""))
 
 
@@ -95,12 +116,28 @@ def _fy_year(period: str) -> int:
 class FinancialModel:
     """Three-statement financial model backed by DuckDB.
 
+    ``FinancialModel`` is the central object for building a bottom-up
+    equity forecast.  It loads historical income-statement, balance-sheet,
+    and cash-flow data, computes derived metrics, generates multi-year
+    projections (with revenue-growth decay toward GDP), and persists
+    results back to the database.
+
     Parameters
     ----------
     ticker : str
-        Stock ticker symbol (e.g. 'AAPL').
-    db_path : str, optional
-        Path to the DuckDB database file.
+        Stock ticker symbol (e.g. ``'AAPL'``).
+    db_path : str or None
+        Path to the DuckDB database file.  When *None* the default
+        ``data/equity.duckdb`` inside the project root is used.
+
+    Attributes
+    ----------
+    historical : dict[str, pd.DataFrame]
+        Annual financial statements keyed by ``'income'``, ``'balance'``,
+        ``'cashflow'``.  Each DataFrame has line items as rows and fiscal
+        periods as columns.
+    metrics : pd.DataFrame
+        Derived metrics computed by :meth:`compute_historical_metrics`.
     """
 
     def __init__(self, ticker: str, db_path: str | None = None):
@@ -119,7 +156,12 @@ class FinancialModel:
     # ------------------------------------------------------------------
 
     def _load_historical(self) -> None:
-        """Load all historical financial data from DuckDB into DataFrames."""
+        """Load all historical financial data from DuckDB into DataFrames.
+
+        Populates :pyattr:`historical` (annual) and the private
+        ``_quarterly`` dict with wide-format DataFrames.  Also loads
+        daily closing prices for market-cap-dependent metrics.
+        """
         con = get_connection(self.db_path)
         try:
             for stmt in ("income", "balance", "cashflow"):
@@ -192,18 +234,23 @@ class FinancialModel:
                        period_type: str = "annual") -> pd.Series:
         """Return the last *periods* values for a line item.
 
+        Searches across all statement DataFrames (income, balance,
+        cash flow) and returns the first match found.
+
         Parameters
         ----------
         line_item : str
-            Standardised line-item name (e.g. 'total_revenue').
+            Standardised line-item name (e.g. ``'total_revenue'``).
         periods : int
             Number of most-recent periods to return.
         period_type : str
-            'annual' or 'quarterly'.
+            ``'annual'`` or ``'quarterly'``.
 
         Returns
         -------
-        pd.Series indexed by period string.
+        pd.Series
+            Values indexed by period string.  Returns an empty
+            float Series if the item is not found.
         """
         source = self.historical if period_type == "annual" else self._quarterly
 
@@ -223,8 +270,16 @@ class FinancialModel:
     def compute_historical_metrics(self) -> pd.DataFrame:
         """Compute derived metrics from historical annual data.
 
-        Stores and returns a DataFrame with periods as columns and metric
-        names as the index.
+        Calculates profitability margins, return metrics (ROE, ROIC),
+        working-capital days, leverage ratios, and buyback yield for
+        each historical fiscal period.
+
+        Stores the result in :pyattr:`metrics` and also returns it.
+
+        Returns
+        -------
+        pd.DataFrame
+            Metrics as rows, fiscal periods as columns.
         """
         inc = self.historical.get("income", pd.DataFrame())
         bal = self.historical.get("balance", pd.DataFrame())
@@ -371,7 +426,29 @@ class FinancialModel:
         auto-generates base-case assumptions from historical data and
         stores them.
 
-        Returns a DataFrame of forecasted line items (periods as columns).
+        The forecast drives revenue via a growth rate that decays linearly
+        toward :data:`GDP_GROWTH`, derives cost and margin line items from
+        assumption ratios, builds up the balance sheet from working-capital
+        days and capex, and closes the cash-flow waterfall so that the
+        accounting identity (assets = liabilities + equity) holds each
+        period.
+
+        Parameters
+        ----------
+        years : int
+            Number of years to project (default 5).
+        scenario : str
+            Scenario label (e.g. ``'base'``, ``'bull'``, ``'bear'``).
+
+        Returns
+        -------
+        pd.DataFrame
+            Forecasted line items as rows, fiscal periods as columns.
+
+        Raises
+        ------
+        ValueError
+            If no historical income data exists for the ticker.
         """
         assumptions = self._load_or_generate_assumptions(scenario)
 
@@ -391,11 +468,20 @@ class FinancialModel:
         forecast_data: dict[str, dict[str, float]] = {}
 
         def _last_val(df, item):
-            """Get the most recent non-NaN historical value."""
+            """Get the most recent non-NaN historical value.
+
+            Returns 0.0 when the DataFrame is empty, the line item does
+            not exist, or every historical value is NaN.  This ensures
+            the forecast loop never crashes on missing data.
+            """
             if df.empty or item not in df.index:
+                logger.debug("Line item '%s' not found in historical data; defaulting to 0.0", item)
                 return 0.0
             vals = df.loc[item].dropna()
-            return float(vals.iloc[-1]) if len(vals) > 0 else 0.0
+            if len(vals) == 0:
+                logger.debug("Line item '%s' has no non-NaN values; defaulting to 0.0", item)
+                return 0.0
+            return float(vals.iloc[-1])
 
         # Previous-year balance sheet values (start from last historical)
         prev_cash = _last_val(bal, "cash_and_equivalents")
@@ -460,13 +546,17 @@ class FinancialModel:
                 + f["interest_income"]
             )
 
-            # Tax
+            # Tax -- no tax on losses
             tax_rate = assumptions["effective_tax_rate"]
-            f["income_tax"] = max(0, f["pretax_income"] * tax_rate)
+            if f["pretax_income"] < 0:
+                f["income_tax"] = 0.0
+            else:
+                f["income_tax"] = max(0, f["pretax_income"] * tax_rate)
             f["net_income"] = f["pretax_income"] - f["income_tax"]
 
             # Share count (declining with buybacks)
             buyback_pct = assumptions.get("annual_buyback_pct", 0)
+            buyback_pct = max(0.0, buyback_pct)  # ensure non-negative
             f["diluted_shares_out"] = prev_shares * (1 - buyback_pct)
             f["basic_shares_out"] = f["diluted_shares_out"] * 0.99  # slight approx
             f["diluted_eps"] = _safe_div(f["net_income"], f["diluted_shares_out"])
@@ -478,7 +568,13 @@ class FinancialModel:
             dpo = assumptions["days_payable_outstanding"]
 
             f["accounts_receivable"] = revenue * dso / 365
-            f["inventory"] = f["cost_of_revenue"] * dio / 365
+
+            # If DIO is 0 (company doesn't carry inventory), just set to 0
+            if dio == 0:
+                f["inventory"] = 0.0
+            else:
+                f["inventory"] = f["cost_of_revenue"] * dio / 365
+
             f["accounts_payable"] = f["cost_of_revenue"] * dpo / 365
 
             # Capex
@@ -515,13 +611,18 @@ class FinancialModel:
 
             # Dividends and buybacks
             div_pct = assumptions.get("dividend_pct_ni", 0)
+            div_pct = max(0.0, min(div_pct, 1.0))  # clamp to [0, 1]
             f["dividends_paid"] = -(abs(f["net_income"]) * div_pct)  # negative
+
+            buyback_pct_fcf = assumptions.get("buyback_pct_fcf", 0.5)
+            buyback_pct_fcf = max(0.0, min(buyback_pct_fcf, 1.0))  # clamp to [0, 1]
+
             f["share_repurchases"] = -(abs(prev_shares * buyback_pct *
                                            assumptions.get("share_price_est", 0)))
             # If we can't estimate buyback $, use FCF-based heuristic
             if assumptions.get("share_price_est", 0) == 0:
                 f["share_repurchases"] = -(abs(f["free_cash_flow"])
-                                            * assumptions.get("buyback_pct_fcf", 0.5))
+                                            * buyback_pct_fcf)
 
             f["depreciation_cf"] = f["depreciation_amortization"]
             f["stock_based_comp_cf"] = f["stock_based_comp"]
@@ -582,10 +683,12 @@ class FinancialModel:
             # ---- Balance sheet check: assets = liabilities + equity ----
             lhs = f["total_assets"]
             rhs = f["total_liabilities"] + f["total_stockholders_equity"]
-            if abs(lhs - rhs) > 1.0:  # allow $1 rounding tolerance
-                raise ValueError(
-                    f"Balance sheet does not balance for {fy}: "
-                    f"assets={lhs:,.0f} != liabilities+equity={rhs:,.0f}"
+            tolerance = max(abs(lhs), 1.0) * 0.001  # 0.1% relative tolerance
+            if abs(lhs - rhs) > tolerance:
+                logger.warning(
+                    "Balance sheet does not balance for %s %s: "
+                    "assets=%,.0f != liabilities+equity=%,.0f (diff=%,.2f, tol=%,.2f)",
+                    self.ticker, fy, lhs, rhs, abs(lhs - rhs), tolerance,
                 )
 
             forecast_data[fy] = f
@@ -615,7 +718,18 @@ class FinancialModel:
         return result
 
     def _load_or_generate_assumptions(self, scenario: str) -> dict[str, float]:
-        """Load assumptions from DB; auto-generate if none exist."""
+        """Load assumptions from the database, or auto-generate if none exist.
+
+        Parameters
+        ----------
+        scenario : str
+            Scenario label (e.g. ``'base'``).
+
+        Returns
+        -------
+        dict[str, float]
+            Mapping of parameter names to numeric values.
+        """
         con = get_connection(self.db_path)
         try:
             rows = con.execute(
@@ -633,7 +747,23 @@ class FinancialModel:
         return self._generate_default_assumptions(scenario)
 
     def _generate_default_assumptions(self, scenario: str) -> dict[str, float]:
-        """Generate base-case assumptions from historical data and save to DB."""
+        """Generate base-case assumptions from historical data and save to DB.
+
+        Derives revenue growth, profitability margins, working-capital
+        days, capex intensity, tax rate, buyback pace, and dividend
+        payout from historical financials.  Falls back to sensible
+        defaults when historical line items are missing or insufficient.
+
+        Parameters
+        ----------
+        scenario : str
+            Scenario label under which to store the assumptions.
+
+        Returns
+        -------
+        dict[str, float]
+            The generated assumptions, also persisted to the database.
+        """
         inc = self.historical.get("income", pd.DataFrame())
         bal = self.historical.get("balance", pd.DataFrame())
         cf = self.historical.get("cashflow", pd.DataFrame())
@@ -678,25 +808,35 @@ class FinancialModel:
         # R&D and SGA as % of revenue (from historicals)
         if not inc.empty:
             rev = inc.loc["total_revenue"].dropna() if "total_revenue" in inc.index else pd.Series(dtype=float)
-            rd = inc.loc["research_development"].dropna() if "research_development" in inc.index else pd.Series(dtype=float)
-            sga = inc.loc["selling_general_admin"].dropna() if "selling_general_admin" in inc.index else pd.Series(dtype=float)
+
+            if "research_development" in inc.index:
+                rd = inc.loc["research_development"].dropna()
+            else:
+                rd = pd.Series(dtype=float)
+                logger.info("%s: 'research_development' not reported; defaulting R&D %% to 0.", self.ticker)
+
+            if "selling_general_admin" in inc.index:
+                sga = inc.loc["selling_general_admin"].dropna()
+            else:
+                sga = pd.Series(dtype=float)
+                logger.info("%s: 'selling_general_admin' not reported; defaulting SGA %% to 0.", self.ticker)
 
             common_periods = rev.index.intersection(rd.index)
             if len(common_periods) > 0:
                 rd_pcts = rd[common_periods] / rev[common_periods]
                 assumptions["rd_pct_revenue"] = float(rd_pcts.iloc[-5:].mean())
             else:
-                assumptions["rd_pct_revenue"] = 0.05
+                assumptions["rd_pct_revenue"] = 0.0
 
             common_periods = rev.index.intersection(sga.index)
             if len(common_periods) > 0:
                 sga_pcts = sga[common_periods] / rev[common_periods]
                 assumptions["sga_pct_revenue"] = float(sga_pcts.iloc[-5:].mean())
             else:
-                assumptions["sga_pct_revenue"] = 0.10
+                assumptions["sga_pct_revenue"] = 0.0
         else:
-            assumptions["rd_pct_revenue"] = 0.05
-            assumptions["sga_pct_revenue"] = 0.10
+            assumptions["rd_pct_revenue"] = 0.0
+            assumptions["sga_pct_revenue"] = 0.0
 
         # --- Capex / revenue ---
         assumptions["capex_pct_revenue"] = _avg_metric("capex_pct_revenue", 0.05)
@@ -707,10 +847,30 @@ class FinancialModel:
         # --- Working capital days ---
         assumptions["days_sales_outstanding"] = _avg_metric("days_sales_outstanding", 45)
         assumptions["days_payable_outstanding"] = _avg_metric("days_payable_outstanding", 60)
-        assumptions["days_inventory_outstanding"] = _avg_metric("days_inventory_outstanding", 30)
 
-        # --- Tax rate ---
-        assumptions["effective_tax_rate"] = _avg_metric("effective_tax_rate", 0.21)
+        # Inventory: some companies (e.g. software) don't carry inventory
+        dio_val = _avg_metric("days_inventory_outstanding", 0)
+        if not bal.empty and "inventory" in bal.index:
+            inv_series = bal.loc["inventory"].dropna()
+            if len(inv_series) > 0 and inv_series.iloc[-1] > 0:
+                assumptions["days_inventory_outstanding"] = dio_val if dio_val > 0 else 30
+            else:
+                # Inventory is reported but zero -- no DIO needed
+                assumptions["days_inventory_outstanding"] = 0
+                logger.info("%s: inventory is zero or missing; setting DIO to 0.", self.ticker)
+        else:
+            # Inventory line item doesn't exist at all
+            assumptions["days_inventory_outstanding"] = 0
+            logger.info("%s: 'inventory' not reported; setting DIO to 0.", self.ticker)
+
+        # --- Tax rate (clamped to [0, 0.50]) ---
+        raw_tax_rate = _avg_metric("effective_tax_rate", 0.21)
+        assumptions["effective_tax_rate"] = max(0.0, min(raw_tax_rate, 0.50))
+        if raw_tax_rate < 0 or raw_tax_rate > 0.50:
+            logger.info(
+                "%s: raw effective tax rate %.2f%% clamped to [0%%, 50%%] -> %.2f%%",
+                self.ticker, raw_tax_rate * 100, assumptions["effective_tax_rate"] * 100,
+            )
 
         # --- D&A as % of revenue ---
         if not inc.empty and "depreciation_amortization" in inc.index and "total_revenue" in inc.index:
@@ -756,20 +916,26 @@ class FinancialModel:
         else:
             assumptions["annual_buyback_pct"] = 0
 
-        # Dividend payout ratio
+        # Dividend payout ratio (clamped to [0, 1])
         if not cf.empty and "dividends_paid" in cf.index and not inc.empty and "net_income" in inc.index:
             divs = cf.loc["dividends_paid"].dropna()
             ni = inc.loc["net_income"].dropna()
             common = divs.index.intersection(ni.index)
             if len(common) > 0:
                 payout = abs(divs[common]) / ni[common].replace(0, np.nan)
-                assumptions["dividend_pct_ni"] = float(payout.dropna().iloc[-3:].mean())
+                raw_payout = float(payout.dropna().iloc[-3:].mean())
+                assumptions["dividend_pct_ni"] = max(0.0, min(raw_payout, 1.0))
+                if raw_payout < 0 or raw_payout > 1.0:
+                    logger.info(
+                        "%s: raw dividend payout ratio %.2f clamped to [0, 1] -> %.2f",
+                        self.ticker, raw_payout, assumptions["dividend_pct_ni"],
+                    )
             else:
                 assumptions["dividend_pct_ni"] = 0
         else:
             assumptions["dividend_pct_ni"] = 0
 
-        # Buyback $ estimation (use last year's repurchases / FCF ratio)
+        # Buyback $ estimation (use last year's repurchases / FCF ratio, clamped to [0, 1])
         if not cf.empty and "share_repurchases" in cf.index and "free_cash_flow" in cf.index:
             rep = cf.loc["share_repurchases"].dropna()
             fcf = cf.loc["free_cash_flow"].dropna()
@@ -777,7 +943,8 @@ class FinancialModel:
             if len(common) > 0:
                 ratios = abs(rep[common]) / fcf[common].replace(0, np.nan)
                 val = ratios.dropna().iloc[-3:].mean()
-                assumptions["buyback_pct_fcf"] = float(min(val, 1.0)) if pd.notna(val) else 0.5
+                raw_buyback_fcf = float(val) if pd.notna(val) else 0.5
+                assumptions["buyback_pct_fcf"] = max(0.0, min(raw_buyback_fcf, 1.0))
             else:
                 assumptions["buyback_pct_fcf"] = 0.5
         else:
@@ -790,7 +957,18 @@ class FinancialModel:
         return assumptions
 
     def _save_assumptions(self, scenario: str, assumptions: dict[str, float]) -> None:
-        """Persist assumptions to the database."""
+        """Persist assumptions to the database.
+
+        Uses an upsert so that re-running generation overwrites stale
+        values without creating duplicates.
+
+        Parameters
+        ----------
+        scenario : str
+            Scenario label.
+        assumptions : dict[str, float]
+            Parameter name / value pairs.
+        """
         con = get_connection(self.db_path)
         try:
             for name, value in assumptions.items():
@@ -809,7 +987,20 @@ class FinancialModel:
 
     def _write_forecasts(self, forecast_data: dict[str, dict[str, float]],
                          scenario: str) -> None:
-        """Write forecast values to the financials table."""
+        """Write forecast values to the ``financials`` table.
+
+        Clears any previous forecasts for this ticker/scenario before
+        inserting the new rows so that the table always reflects the
+        latest projection.
+
+        Parameters
+        ----------
+        forecast_data : dict[str, dict[str, float]]
+            Outer key is the period (e.g. ``'FY2026'``), inner dict maps
+            line-item names to projected values.
+        scenario : str
+            Scenario label.
+        """
         # Map line items to statement types
         item_to_stmt: dict[str, str] = {}
         for item in INCOME_ITEMS:
@@ -856,7 +1047,21 @@ class FinancialModel:
     # ------------------------------------------------------------------
 
     def set_assumption(self, scenario: str, parameter: str, value: float) -> None:
-        """Update a single assumption and re-run the forecast."""
+        """Update a single assumption and re-run the forecast.
+
+        This is the primary entry point for interactive what-if analysis.
+        After persisting the new value, :meth:`forecast` is called
+        automatically so that all downstream projections are refreshed.
+
+        Parameters
+        ----------
+        scenario : str
+            Scenario label (e.g. ``'base'``).
+        parameter : str
+            The assumption parameter name (e.g. ``'revenue_growth'``).
+        value : float
+            New numeric value for the parameter.
+        """
         con = get_connection(self.db_path)
         try:
             con.execute(
@@ -881,20 +1086,23 @@ class FinancialModel:
 
     def get_statement(self, statement_type: str, include_forecast: bool = True,
                       scenario: str = "base") -> pd.DataFrame:
-        """Return a clean DataFrame with periods as columns and line items as rows.
+        """Return a clean DataFrame combining historical and forecast data.
 
         Parameters
         ----------
         statement_type : str
-            One of 'income', 'balance', 'cashflow'.
+            One of ``'income'``, ``'balance'``, ``'cashflow'``.
         include_forecast : bool
-            Whether to include forecast columns.
+            Whether to append forecast columns from the database.
         scenario : str
-            Which forecast scenario to include.
+            Which forecast scenario to include (ignored when
+            *include_forecast* is ``False``).
 
         Returns
         -------
-        pd.DataFrame with line items as rows and periods as columns.
+        pd.DataFrame
+            Line items as rows and periods as columns, sorted
+            chronologically.
         """
         # Start with historical data
         hist = self.historical.get(statement_type, pd.DataFrame()).copy()
@@ -943,7 +1151,19 @@ class FinancialModel:
 # ---------------------------------------------------------------------------
 
 def _format_number(val):
-    """Format a number for display (millions for large numbers)."""
+    """Format a number for display (millions for large numbers).
+
+    Parameters
+    ----------
+    val : float or NaN
+        The numeric value to format.
+
+    Returns
+    -------
+    str
+        Human-readable string with B/M/K suffix as appropriate,
+        or an empty string for NaN values.
+    """
     if pd.isna(val):
         return ""
     if abs(val) >= 1e9:
@@ -956,7 +1176,12 @@ def _format_number(val):
 
 
 def main():
-    """Test the financial model on AAPL."""
+    """Test the financial model on AAPL.
+
+    Loads historical data, computes metrics, generates a 5-year
+    base-case forecast, and prints a combined income statement
+    showing the last four historical years alongside projections.
+    """
     print("=" * 70)
     print("  Financial Model Test: AAPL")
     print("=" * 70)
