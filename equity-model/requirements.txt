@@ -4,5 +4,6 @@ requests
 pyyaml
 pandas
 numpy
+scipy
 plotly
 rich
